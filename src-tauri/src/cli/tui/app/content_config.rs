@@ -544,7 +544,7 @@ impl App {
                         })
                     } else {
                         let options = form.available_fallback_options(&model_options);
-                        (!options.is_empty()).then(|| (row, 0, options))
+                        (!options.is_empty()).then_some((row, 0, options))
                     }
                 }
                 OpenClawAgentsSection::Runtime => None,
@@ -799,6 +799,19 @@ impl App {
                     });
                     Action::None
                 }
+                Some(SettingsItem::CodexUnifiedSessionHistory) => {
+                    let current = crate::settings::unify_codex_session_history();
+                    let next = !current;
+
+                    self.overlay = Overlay::Confirm(ConfirmOverlay {
+                        title: texts::tui_confirm_title().to_string(),
+                        message: texts::codex_unified_session_history_confirm(next),
+                        action: ConfirmAction::SettingsSetCodexUnifiedSessionHistory {
+                            enabled: next,
+                        },
+                    });
+                    Action::None
+                }
                 Some(SettingsItem::Proxy) => self.push_route_and_switch(Route::SettingsProxy),
                 Some(SettingsItem::CheckForUpdates) => Action::CheckUpdate,
                 None => Action::None,
@@ -876,7 +889,7 @@ impl App {
                 Some(LocalProxySettingsItem::ListenAddress) => {
                     if data.proxy.running {
                         self.push_toast(
-                            texts::tui_toast_proxy_settings_stop_before_edit(),
+                            texts::tui_toast_proxy_settings_stop_proxy_before_edit_address(),
                             ToastKind::Info,
                         );
                         return Action::None;
@@ -891,9 +904,9 @@ impl App {
                     Action::None
                 }
                 Some(LocalProxySettingsItem::ListenPort) => {
-                    if data.proxy.running {
+                    if data.proxy.has_active_worker_for(&self.app_type) {
                         self.push_toast(
-                            texts::tui_toast_proxy_settings_stop_before_edit(),
+                            texts::tui_toast_proxy_settings_stop_app_route_before_edit_port(),
                             ToastKind::Info,
                         );
                         return Action::None;
@@ -1110,6 +1123,10 @@ impl App {
                 ),
             ]);
         } else {
+            let current_app_has_active_worker = data.proxy.has_active_worker_for(&self.app_type);
+            let port_edit_hint =
+                texts::tui_settings_proxy_stop_before_edit_hint(current_app_has_active_worker)
+                    .to_string();
             lines.extend([
                 format!(
                     "{}: {}:{}",
@@ -1117,11 +1134,7 @@ impl App {
                     data.proxy.configured_listen_address,
                     data.proxy.configured_listen_port
                 ),
-                crate::t!(
-                    "Stop the local proxy before editing listen address or port. Restart routing after those settings change.",
-                    "修改监听地址或端口前需要先停止本地代理；改完后重新启动路由才会生效。"
-                )
-                .to_string(),
+                port_edit_hint,
             ]);
         }
 

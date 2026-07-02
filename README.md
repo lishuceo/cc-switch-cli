@@ -2,7 +2,7 @@
 
 # CC-Switch CLI
 
-[![Version](https://img.shields.io/badge/version-5.8.2-blue.svg)](https://github.com/saladday/cc-switch-cli/releases)
+[![Version](https://img.shields.io/badge/version-5.8.6-blue.svg)](https://github.com/saladday/cc-switch-cli/releases)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](https://github.com/saladday/cc-switch-cli/releases)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -37,6 +37,16 @@ This project is a **CLI fork** of [CC-Switch](https://github.com/farion1231/cc-s
 ## ❤️ Sponsor
 
 <table>
+  <tr>
+    <td width="180">
+      <a href="https://console.claudeapi.com/register?source=cc-switch-cli">
+        <img src="assets/partners/logos/claudeapi.png" alt="ClaudeAPI" width="150">
+      </a>
+    </td>
+    <td>
+      Thanks to <b>ClaudeAPI</b> for supporting this project! <b>ClaudeAPI</b> is a Claude-focused API access provider built on official and AWS channels, offering high stability, low latency, and full support for Claude Code, Codex, Agent workflows, and enterprise use cases. It also supports business onboarding, team usage management, and invoicing. Exclusive offer for CC-Switch CLI users: register via this <a href="https://console.claudeapi.com/register?source=cc-switch-cli">exclusive link</a> to receive free trial credits and get started with Claude Code instantly.
+    </td>
+  </tr>
   <tr>
     <td width="180">
       <a href="https://www.packyapi.com/register?aff=cc-switch-cli">
@@ -344,11 +354,12 @@ cc-switch prompts delete <id>        # Delete prompt
 
 Manage and extend Claude Code/Codex/Gemini/OpenCode/Hermes capabilities with community skills.
 
-**Features:** SSOT-based skills store, multi-app enable/disable, sync to app directories, unmanaged scan/import, repo discovery.
+**Features:** SSOT-based skills store, multi-app enable/disable, sync to app directories, unmanaged scan/import, repo discovery, skills.sh marketplace search.
 
 ```bash
 cc-switch skills list                # List installed skills
 cc-switch skills discover <query>      # Discover available skills (alias: search)
+cc-switch skills market <query>      # Search skills.sh marketplace
 cc-switch skills install <name>      # Install a skill
 cc-switch skills uninstall <name>    # Uninstall a skill
 cc-switch skills enable <name>       # Enable for current app (--app)
@@ -440,6 +451,14 @@ cc-switch proxy serve --takeover claude           # Foreground debug mode; refus
 ```
 
 Normal CLI/TUI proxy enable/disable actions are routed through the daemon. The daemon auto-starts when the first app proxy route is activated, runs one worker per active supported app (Claude, Codex, Gemini), and exits automatically when no proxy routes remain active.
+
+> **Platform support:** The daemon-managed proxy relies on a Unix-domain-socket supervisor and is available **only on macOS and Linux**. On Windows, `proxy enable` / `proxy disable` and the `daemon` subcommand are unavailable and fail with `managed sessions are only supported on unix`. To run the local proxy on Windows, use the foreground mode instead, which starts the relay without the supervisor:
+>
+> ```bash
+> cc-switch proxy serve --takeover claude
+> ```
+>
+> `proxy show` and `proxy config` work on all platforms. See [#294](https://github.com/SaladDay/cc-switch-cli/issues/294).
 
 ### 🧪 Environment & Local Tools
 

@@ -73,6 +73,75 @@ async fn pricing_model_source_round_trips_and_rejects_unknown_values() -> Result
 }
 
 #[tokio::test]
+async fn failover_live_snapshots_round_trip_and_delete() -> Result<(), AppError> {
+    let db = Database::memory()?;
+    save_queue_provider(&db, "claude", "provider-a")?;
+    save_queue_provider(&db, "claude", "provider-b")?;
+
+    db.save_failover_live_snapshot("claude", "provider-a", r#"{"env":{"TOKEN":"a"}}"#)
+        .await?;
+    db.save_failover_live_snapshot("claude", "provider-b", r#"{"env":{"TOKEN":"b"}}"#)
+        .await?;
+
+    let snapshot = db
+        .get_failover_live_snapshot("claude", "provider-a")
+        .await?
+        .expect("provider-a snapshot");
+    assert_eq!(snapshot.app_type, "claude");
+    assert_eq!(snapshot.provider_id, "provider-a");
+    assert_eq!(snapshot.config_json, r#"{"env":{"TOKEN":"a"}}"#);
+    assert!(!snapshot.generated_at.is_empty());
+
+    let listed = db.list_failover_live_snapshots("claude").await?;
+    assert_eq!(listed.len(), 2);
+
+    db.delete_failover_live_snapshot("claude", "provider-a")
+        .await?;
+    assert!(db
+        .get_failover_live_snapshot("claude", "provider-a")
+        .await?
+        .is_none());
+    assert_eq!(db.list_failover_live_snapshots("claude").await?.len(), 1);
+
+    db.delete_failover_live_snapshots_for_app("claude").await?;
+    assert!(db.list_failover_live_snapshots("claude").await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_all_failover_live_snapshots_clears_every_app() -> Result<(), AppError> {
+    let db = Database::memory()?;
+    save_queue_provider(&db, "claude", "claude-provider")?;
+    save_queue_provider(&db, "codex", "codex-provider")?;
+    db.save_failover_live_snapshot("claude", "claude-provider", "{}")
+        .await?;
+    db.save_failover_live_snapshot("codex", "codex-provider", "{}")
+        .await?;
+
+    db.delete_all_failover_live_snapshots().await?;
+
+    assert!(db.list_failover_live_snapshots("claude").await?.is_empty());
+    assert!(db.list_failover_live_snapshots("codex").await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn failover_live_snapshots_are_deleted_with_provider() -> Result<(), AppError> {
+    let db = Database::memory()?;
+    save_queue_provider(&db, "claude", "provider-a")?;
+    db.save_failover_live_snapshot("claude", "provider-a", "{}")
+        .await?;
+
+    db.delete_provider("claude", "provider-a")?;
+
+    assert!(db
+        .get_failover_live_snapshot("claude", "provider-a")
+        .await?
+        .is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn clear_auto_failover_for_supported_apps_disables_failover_flags() -> Result<(), AppError> {
     let db = Database::memory()?;
     save_queue_provider(&db, "claude", "claude-p1")?;
@@ -124,6 +193,18 @@ fn app_proxy_preferred_ports_round_trip() -> Result<(), AppError> {
     Ok(())
 }
 
+#[test]
+fn default_app_proxy_preferred_ports_are_distinct() -> Result<(), AppError> {
+    let db = Database::memory()?;
+
+    assert_eq!(db.get_app_proxy_preferred_port("claude")?, 15721);
+    assert_eq!(db.get_app_proxy_preferred_port("codex")?, 15722);
+    assert_eq!(db.get_app_proxy_preferred_port("gemini")?, 15723);
+    assert_eq!(db.get_app_proxy_preferred_port("unknown")?, 15724);
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn app_preferred_port_falls_back_to_legacy_proxy_config() -> Result<(), AppError> {
     let db = Database::memory()?;
@@ -132,9 +213,25 @@ async fn app_preferred_port_falls_back_to_legacy_proxy_config() -> Result<(), Ap
     db.update_proxy_config(config).await?;
 
     assert_eq!(db.get_app_proxy_preferred_port("claude")?, 17021);
+    assert_eq!(db.get_app_proxy_preferred_port("codex")?, 17021);
+    assert_eq!(db.get_app_proxy_preferred_port("gemini")?, 17021);
 
     db.set_app_proxy_preferred_port("claude", 17022)?;
     assert_eq!(db.get_app_proxy_preferred_port("claude")?, 17022);
+    Ok(())
+}
+
+#[tokio::test]
+async fn app_preferred_port_ignores_legacy_claude_default_for_other_apps() -> Result<(), AppError> {
+    let db = Database::memory()?;
+    let mut config = db.get_proxy_config().await?;
+    config.listen_port = 15721;
+    db.update_proxy_config(config).await?;
+
+    assert_eq!(db.get_app_proxy_preferred_port("claude")?, 15721);
+    assert_eq!(db.get_app_proxy_preferred_port("codex")?, 15722);
+    assert_eq!(db.get_app_proxy_preferred_port("gemini")?, 15723);
+
     Ok(())
 }
 

@@ -25,6 +25,7 @@ use crate::{
         types::{ActiveTarget, GlobalProxyConfig, ProxyTakeoverStatus},
         ProxyConfig, ProxyServer, ProxyServerInfo, ProxyStatus,
     },
+    services::provider::live_merge,
     AppError,
 };
 
@@ -80,16 +81,12 @@ pub struct GlobalProxySwitchUpdate {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 enum PersistedProxyRuntimeSessionKind {
     #[serde(alias = "foreground")]
+    #[default]
     Foreground,
     ManagedExternal,
-}
-
-impl Default for PersistedProxyRuntimeSessionKind {
-    fn default() -> Self {
-        Self::Foreground
-    }
 }
 
 impl PersistedProxyRuntimeSessionKind {
@@ -143,9 +140,17 @@ pub(crate) struct LiveManagedRuntimeSession {
 }
 
 enum ExternalProxyStatusProbe {
-    Matched(ProxyStatus),
+    Matched(Box<ProxyStatus>),
     Mismatched,
     Unreachable,
+}
+
+struct AutoFailoverActivation {
+    app_type: AppType,
+    previous_db_current_provider: Option<String>,
+    previous_local_current_provider: Option<String>,
+    previous_live_backup: Option<String>,
+    rollback_live_backup: String,
 }
 
 fn proxy_runtime_registry() -> &'static StdMutex<HashMap<String, Weak<ProxyRuntimeState>>> {
@@ -727,14 +732,14 @@ impl ProxyService {
             self.sync_persisted_global_proxy_enabled(false).await?;
         }
         if let Some(session) = self.load_persisted_runtime_session_for_app(&app) {
-            if session.kind.is_managed_external() {
-                if matches!(
+            if session.kind.is_managed_external()
+                && matches!(
                     Self::probe_external_proxy_status(&session).await,
                     ExternalProxyStatusProbe::Matched(_)
-                ) && Self::is_process_alive(session.pid)
-                {
-                    Self::terminate_external_process(session.pid).await?;
-                }
+                )
+                && Self::is_process_alive(session.pid)
+            {
+                Self::terminate_external_process(session.pid).await?;
             }
         }
         let _ = self.clear_persisted_runtime_session_for_app(&app);
@@ -910,6 +915,8 @@ impl ProxyService {
 
             if !app_proxy.enabled && !has_backup && !live_taken_over {
                 self.clear_app_proxy_routing_flags(app_proxy).await?;
+                self.delete_failover_live_snapshots_for_app(&app_type)
+                    .await?;
                 continue;
             }
 
@@ -933,6 +940,8 @@ impl ProxyService {
             }
 
             self.clear_app_proxy_routing_flags(app_proxy).await?;
+            self.delete_failover_live_snapshots_for_app(&app_type)
+                .await?;
         }
 
         Ok(())
@@ -994,15 +1003,15 @@ impl ProxyService {
         }
 
         if let Some(session) = self.load_persisted_runtime_session() {
-            if session.kind.is_managed_external() {
-                if matches!(
+            if session.kind.is_managed_external()
+                && matches!(
                     Self::probe_external_proxy_status(&session).await,
                     ExternalProxyStatusProbe::Matched(_)
-                ) && Self::is_process_alive(session.pid)
-                {
-                    Self::terminate_external_process(session.pid).await?;
-                    stopped_runtime = true;
-                }
+                )
+                && Self::is_process_alive(session.pid)
+            {
+                Self::terminate_external_process(session.pid).await?;
+                stopped_runtime = true;
             }
         }
 
@@ -1063,7 +1072,8 @@ impl ProxyService {
                 }
 
                 match Self::probe_external_proxy_status(&session).await {
-                    ExternalProxyStatusProbe::Matched(mut status) => {
+                    ExternalProxyStatusProbe::Matched(status) => {
+                        let mut status = *status;
                         workers.push(crate::proxy::types::ActiveWorker {
                             app_type: session
                                 .app_type
@@ -1507,6 +1517,9 @@ impl ProxyService {
             self.db.clear_auto_failover_for_supported_apps().await?
         };
         self.db.update_global_proxy_config(config.clone()).await?;
+        if !enabled {
+            self.db.delete_all_failover_live_snapshots().await?;
+        }
 
         Ok(GlobalProxySwitchUpdate {
             config,
@@ -1521,6 +1534,204 @@ impl ProxyService {
             .first()
             .map(|item| item.provider_id.clone())
             .ok_or_else(|| "failover queue is empty".to_string())
+    }
+
+    fn failover_queue_providers(&self, app_type: &AppType) -> Result<Vec<Provider>, String> {
+        let app_key = app_type.as_str();
+        self.db
+            .get_failover_queue(app_key)
+            .map_err(|error| format!("load failover queue for {app_key} failed: {error}"))?
+            .into_iter()
+            .map(|item| {
+                self.db
+                    .get_provider_by_id(&item.provider_id, app_key)
+                    .map_err(|error| {
+                        format!(
+                            "load failover provider {} for {app_key} failed: {error}",
+                            item.provider_id
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        format!("failover provider does not exist: {}", item.provider_id)
+                    })
+            })
+            .collect()
+    }
+
+    async fn original_failover_live_base(
+        &self,
+        app_type: &AppType,
+        fallback_provider_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let app_key = app_type.as_str();
+        if let Some(existing) = self.load_live_backup_value(app_type).await? {
+            return Ok(existing);
+        }
+
+        let (live, sync_live_token_to_current, _) = self
+            .read_takeover_source_live(app_type, fallback_provider_id)
+            .await?;
+        let backup = serde_json::to_string(&live)
+            .map_err(|error| format!("serialize {app_key} live backup failed: {error}"))?;
+        self.db
+            .save_live_backup(app_key, &backup)
+            .await
+            .map_err(|error| format!("save {app_key} live backup failed: {error}"))?;
+        if sync_live_token_to_current {
+            self.sync_live_config_to_current_provider(app_type, &live)
+                .await?;
+        }
+
+        Ok(live)
+    }
+
+    fn build_failover_live_snapshot(
+        &self,
+        app_type: &AppType,
+        original_live: &Value,
+        provider: &Provider,
+    ) -> Result<Value, String> {
+        let mut provider_snapshot = self.build_live_snapshot_from_provider(app_type, provider)?;
+        Self::apply_codex_unified_session_bucket_to_backup(
+            app_type,
+            provider,
+            &mut provider_snapshot,
+        )?;
+        Self::merge_live_backup_snapshot(app_type, Some(original_live), None, provider_snapshot)
+    }
+
+    async fn save_failover_live_snapshot(
+        &self,
+        app_type: &AppType,
+        provider_id: &str,
+        snapshot: &Value,
+    ) -> Result<(), String> {
+        let app_key = app_type.as_str();
+        let serialized = serde_json::to_string(snapshot).map_err(|error| {
+            format!("serialize {app_key} failover live snapshot for {provider_id} failed: {error}")
+        })?;
+        self.db
+            .save_failover_live_snapshot(app_key, provider_id, &serialized)
+            .await
+            .map_err(|error| {
+                format!("save {app_key} failover live snapshot for {provider_id} failed: {error}")
+            })
+    }
+
+    async fn regenerate_failover_live_snapshots_for_app(
+        &self,
+        app_type: &AppType,
+        fallback_provider_id: Option<&str>,
+    ) -> Result<(), String> {
+        let app_key = app_type.as_str();
+        let providers = self.failover_queue_providers(app_type)?;
+        let original_live = self
+            .original_failover_live_base(app_type, fallback_provider_id)
+            .await?;
+        self.db
+            .delete_failover_live_snapshots_for_app(app_key)
+            .await
+            .map_err(|error| format!("clear {app_key} failover live snapshots failed: {error}"))?;
+
+        for provider in providers {
+            let snapshot =
+                self.build_failover_live_snapshot(app_type, &original_live, &provider)?;
+            self.save_failover_live_snapshot(app_type, &provider.id, &snapshot)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn failover_live_snapshot_for_provider(
+        &self,
+        app_type: &AppType,
+        provider: &Provider,
+    ) -> Result<Value, String> {
+        let app_key = app_type.as_str();
+        if let Some(snapshot) = self
+            .db
+            .get_failover_live_snapshot(app_key, &provider.id)
+            .await
+            .map_err(|error| {
+                format!(
+                    "load {app_key} failover live snapshot for {} failed: {error}",
+                    provider.id
+                )
+            })?
+        {
+            return serde_json::from_str(&snapshot.config_json).map_err(|error| {
+                format!(
+                    "parse {app_key} failover live snapshot for {} failed: {error}",
+                    provider.id
+                )
+            });
+        }
+
+        let original_live = self
+            .original_failover_live_base(app_type, Some(&provider.id))
+            .await?;
+        let snapshot = self.build_failover_live_snapshot(app_type, &original_live, provider)?;
+        self.save_failover_live_snapshot(app_type, &provider.id, &snapshot)
+            .await?;
+        Ok(snapshot)
+    }
+
+    async fn write_failover_live_snapshot_for_provider(
+        &self,
+        app_type: &AppType,
+        provider: &Provider,
+    ) -> Result<(), String> {
+        let mut live = self
+            .failover_live_snapshot_for_provider(app_type, provider)
+            .await?;
+        let (proxy_url, proxy_codex_base_url) = self.build_proxy_urls_for_app(app_type).await?;
+        self.rewrite_live_for_proxy(
+            app_type,
+            &mut live,
+            &proxy_url,
+            &proxy_codex_base_url,
+            Some(provider),
+        )?;
+        if matches!(app_type, AppType::Codex) {
+            self.write_codex_live_for_provider(&live, Some(provider))
+        } else {
+            self.write_live_config_for_app(app_type, &live)
+        }
+    }
+
+    pub async fn refresh_failover_live_snapshot_for_provider(
+        &self,
+        app_type: &str,
+        provider: &Provider,
+    ) -> Result<(), String> {
+        let app_type = Self::takeover_app_from_str(app_type)?;
+        let original_live = self
+            .original_failover_live_base(&app_type, Some(&provider.id))
+            .await?;
+        let snapshot = self.build_failover_live_snapshot(&app_type, &original_live, provider)?;
+        self.save_failover_live_snapshot(&app_type, &provider.id, &snapshot)
+            .await?;
+
+        if self.detect_takeover_in_live_config_for_app(&app_type) {
+            self.write_failover_live_snapshot_for_provider(&app_type, provider)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn delete_failover_live_snapshots_for_app(
+        &self,
+        app_type: &AppType,
+    ) -> Result<(), String> {
+        let app_key = app_type.as_str();
+        self.db
+            .delete_failover_live_snapshots_for_app(app_key)
+            .await
+            .map_err(|error| {
+                format!("delete failover live snapshots for {app_key} failed: {error}")
+            })
     }
 
     async fn persist_auto_failover_for_app(
@@ -1598,33 +1809,142 @@ impl ProxyService {
 
     pub async fn enable_auto_failover_for_app(&self, app_type: &str) -> Result<(), String> {
         let first_provider_id = self.first_failover_provider_id(app_type)?;
-        self.ensure_proxy_routing_active_for_app(app_type).await?;
-        self.switch_proxy_target(app_type, &first_provider_id)
+        let app_type = Self::takeover_app_from_str(app_type)?;
+        let app_key = app_type.as_str();
+        self.ensure_proxy_routing_active_for_app(app_key).await?;
+        self.regenerate_failover_live_snapshots_for_app(&app_type, Some(&first_provider_id))
             .await?;
-        self.persist_auto_failover_for_app(app_type, true).await
+        self.switch_proxy_target(app_key, &first_provider_id)
+            .await?;
+        self.persist_auto_failover_for_app(app_key, true).await
     }
 
     async fn prepare_proxy_and_auto_failover_activation(
         &self,
         app_type: &str,
-    ) -> Result<AppType, String> {
+    ) -> Result<AutoFailoverActivation, String> {
         let first_provider_id = self.first_failover_provider_id(app_type)?;
         let app_type = Self::takeover_app_from_str(app_type)?;
         let app_key = app_type.as_str();
+        let previous_db_current_provider = self
+            .db
+            .get_current_provider(app_key)
+            .map_err(|error| format!("load current provider for {app_key} failed: {error}"))?;
+        let previous_local_current_provider = crate::settings::get_current_provider(&app_type);
+        let previous_live_backup = self
+            .db
+            .get_live_backup(app_key)
+            .await
+            .map_err(|error| format!("load live backup for {app_key} failed: {error}"))?
+            .map(|backup| backup.original_config);
+        self.regenerate_failover_live_snapshots_for_app(&app_type, Some(&first_provider_id))
+            .await?;
+        let rollback_live_backup = self
+            .db
+            .get_live_backup(app_key)
+            .await
+            .map_err(|error| format!("load rollback backup for {app_key} failed: {error}"))?
+            .map(|backup| backup.original_config)
+            .ok_or_else(|| format!("missing rollback backup for {app_key}"))?;
         self.switch_proxy_target(app_key, &first_provider_id)
             .await?;
-        Ok(app_type)
+        Ok(AutoFailoverActivation {
+            app_type,
+            previous_db_current_provider,
+            previous_local_current_provider,
+            previous_live_backup,
+            rollback_live_backup,
+        })
+    }
+
+    fn restore_current_provider_after_activation_failure(
+        &self,
+        activation: &AutoFailoverActivation,
+    ) -> Result<(), String> {
+        let app_key = activation.app_type.as_str();
+        match activation.previous_db_current_provider.as_deref() {
+            Some(provider_id) => {
+                self.db
+                    .set_current_provider(app_key, provider_id)
+                    .map_err(|error| {
+                        format!("restore current provider for {app_key} failed: {error}")
+                    })?
+            }
+            None => self.clear_database_current_provider_for_app(app_key)?,
+        }
+        crate::settings::set_current_provider(
+            &activation.app_type,
+            activation.previous_local_current_provider.as_deref(),
+        )
+        .map_err(|error| format!("restore local current provider for {app_key} failed: {error}"))
+    }
+
+    fn clear_database_current_provider_for_app(&self, app_type: &str) -> Result<(), String> {
+        let conn = self.db.conn.lock().map_err(|error| {
+            format!("lock database to clear current provider for {app_type} failed: {error}")
+        })?;
+        conn.execute(
+            "UPDATE providers SET is_current = 0 WHERE app_type = ?1",
+            rusqlite::params![app_type],
+        )
+        .map_err(|error| format!("clear current provider for {app_type} failed: {error}"))?;
+        Ok(())
     }
 
     pub async fn enable_proxy_and_auto_failover_for_app(
         &self,
         app_type: &str,
     ) -> Result<(), String> {
-        let app_type = self
-            .prepare_proxy_and_auto_failover_activation(app_type)
-            .await?;
-        let app_key = app_type.as_str();
-        self.set_managed_session_for_app(app_key, true).await?;
+        let activation = {
+            let _guard =
+                crate::services::state_coordination::acquire_restore_mutation_guard().await?;
+            self.prepare_proxy_and_auto_failover_activation(app_type)
+                .await?
+        };
+        let app_key = activation.app_type.as_str();
+        if let Err(start_error) = self.set_managed_session_for_app(app_key, true).await {
+            {
+                let _guard =
+                    crate::services::state_coordination::acquire_restore_mutation_guard().await?;
+                self.db
+                    .save_live_backup(app_key, &activation.rollback_live_backup)
+                    .await
+                    .map_err(|rollback_error| {
+                        format!(
+                            "enable proxy and auto failover failed: {start_error}; rollback failed: restore live backup for {app_key} failed: {rollback_error}"
+                        )
+                    })?;
+                if let Err(rollback_error) = self
+                    .disable_takeover_for_app_unlocked(&activation.app_type, false)
+                    .await
+                {
+                    return Err(format!(
+                        "enable proxy and auto failover failed: {start_error}; rollback failed: {rollback_error}"
+                    ));
+                }
+                let restore_backup_result = match activation.previous_live_backup.as_deref() {
+                    Some(previous_live_backup) => {
+                        self.db
+                            .save_live_backup(app_key, previous_live_backup)
+                            .await
+                    }
+                    None => self.db.delete_live_backup(app_key).await,
+                };
+                if let Err(rollback_error) = restore_backup_result {
+                    return Err(format!(
+                        "enable proxy and auto failover failed: {start_error}; rollback failed: restore prior live backup for {app_key} failed: {rollback_error}"
+                    ));
+                }
+                if let Err(rollback_error) =
+                    self.restore_current_provider_after_activation_failure(&activation)
+                {
+                    return Err(format!(
+                        "enable proxy and auto failover failed: {start_error}; rollback failed: {rollback_error}"
+                    ));
+                }
+            }
+            return Err(start_error);
+        }
         self.persist_auto_failover_for_app(app_key, true).await?;
 
         Ok(())
@@ -1764,46 +2084,247 @@ impl ProxyService {
         app_type: &str,
         provider: &Provider,
     ) -> Result<(), String> {
+        let app_type_enum = Self::takeover_app_from_str(app_type)?;
+        let mut backup_snapshot =
+            self.build_live_snapshot_from_provider(&app_type_enum, provider)?;
+        Self::apply_codex_unified_session_bucket_to_backup(
+            &app_type_enum,
+            provider,
+            &mut backup_snapshot,
+        )?;
+        let existing_backup_value = self.load_live_backup_value(&app_type_enum).await?;
+        let backup_snapshot = Self::merge_live_backup_snapshot(
+            &app_type_enum,
+            existing_backup_value.as_ref(),
+            None,
+            backup_snapshot,
+        )?;
+        self.save_live_backup_snapshot(app_type, &backup_snapshot)
+            .await
+    }
+
+    pub(crate) async fn prepare_live_backup_from_provider(
+        &self,
+        app_type: &str,
+        provider: &Provider,
+        previous_provider: Option<&Provider>,
+    ) -> Result<Value, String> {
         let app_type = Self::takeover_app_from_str(app_type)?;
         let mut backup_snapshot = self.build_live_snapshot_from_provider(&app_type, provider)?;
+        Self::apply_codex_unified_session_bucket_to_backup(
+            &app_type,
+            provider,
+            &mut backup_snapshot,
+        )?;
+        let previous_backup_snapshot = previous_provider
+            .map(|provider| {
+                let mut snapshot = self.build_live_snapshot_from_provider(&app_type, provider)?;
+                Self::apply_codex_unified_session_bucket_to_backup(
+                    &app_type,
+                    provider,
+                    &mut snapshot,
+                )?;
+                Ok::<Value, String>(snapshot)
+            })
+            .transpose()?;
+        let existing_backup_value = self.load_live_backup_value(&app_type).await?;
+        Self::merge_live_backup_snapshot(
+            &app_type,
+            existing_backup_value.as_ref(),
+            previous_backup_snapshot.as_ref(),
+            backup_snapshot,
+        )
+    }
 
-        if matches!(app_type, AppType::Codex) {
-            let existing_backup_value = self
-                .db
-                .get_live_backup(app_type.as_str())
-                .await
-                .map_err(|error| {
+    async fn load_live_backup_value(&self, app_type: &AppType) -> Result<Option<Value>, String> {
+        self.db
+            .get_live_backup(app_type.as_str())
+            .await
+            .map_err(|error| {
+                format!(
+                    "load {} existing live backup failed: {error}",
+                    app_type.as_str()
+                )
+            })?
+            .map(|backup| {
+                serde_json::from_str::<Value>(&backup.original_config).map_err(|error| {
                     format!(
-                        "load {} existing live backup failed: {error}",
+                        "parse {} existing live backup failed: {error}",
                         app_type.as_str()
                     )
-                })?
-                .map(|backup| {
-                    serde_json::from_str::<Value>(&backup.original_config).map_err(|error| {
-                        format!(
-                            "parse {} existing live backup failed: {error}",
-                            app_type.as_str()
-                        )
-                    })
                 })
-                .transpose()?;
+            })
+            .transpose()
+    }
 
-            if let Some(existing_value) = existing_backup_value.as_ref() {
-                Self::preserve_codex_mcp_servers_in_backup(&mut backup_snapshot, existing_value)?;
-            }
+    fn apply_codex_unified_session_bucket_to_backup(
+        app_type: &AppType,
+        provider: &Provider,
+        backup_snapshot: &mut Value,
+    ) -> Result<(), String> {
+        if !matches!(app_type, AppType::Codex) {
+            return Ok(());
         }
 
-        if matches!(app_type, AppType::Gemini) {
-            backup_snapshot = json!({
-                "env": backup_snapshot
+        crate::codex_config::apply_codex_unified_session_bucket_to_settings(
+            crate::services::provider::ProviderService::codex_live_write_category(provider),
+            backup_snapshot,
+        )
+        .map_err(|error| {
+            format!("apply Codex unified session bucket to live backup failed: {error}")
+        })
+    }
+
+    fn merge_live_backup_snapshot(
+        app_type: &AppType,
+        existing_backup: Option<&Value>,
+        previous_backup_snapshot: Option<&Value>,
+        backup_snapshot: Value,
+    ) -> Result<Value, String> {
+        match app_type {
+            AppType::Claude => match (existing_backup, previous_backup_snapshot) {
+                (Some(existing), Some(base)) => live_merge::merge_json_with_base_live(
+                    app_type,
+                    "proxy live backup",
+                    existing.clone(),
+                    base,
+                    &backup_snapshot,
+                )
+                .map_err(|error| error.to_string()),
+                (Some(existing), None) => live_merge::merge_json_live(
+                    app_type,
+                    "proxy live backup",
+                    existing.clone(),
+                    &backup_snapshot,
+                )
+                .map_err(|error| error.to_string()),
+                (None, _) => Ok(backup_snapshot),
+            },
+            AppType::Codex => Self::merge_codex_live_backup(
+                existing_backup,
+                previous_backup_snapshot,
+                backup_snapshot,
+            ),
+            AppType::Gemini => {
+                let incoming_env = backup_snapshot
                     .get("env")
                     .cloned()
-                    .unwrap_or_else(|| json!({}))
-            });
+                    .unwrap_or_else(|| json!({}));
+                let incoming_snapshot = json!({ "env": incoming_env });
+                let base_snapshot = previous_backup_snapshot.map(|base| {
+                    let base_env = base.get("env").cloned().unwrap_or_else(|| json!({}));
+                    json!({ "env": base_env })
+                });
+                match (existing_backup, base_snapshot.as_ref()) {
+                    (Some(existing), Some(base)) => live_merge::merge_json_with_base_live(
+                        app_type,
+                        "proxy live backup",
+                        existing.clone(),
+                        base,
+                        &incoming_snapshot,
+                    )
+                    .map_err(|error| error.to_string()),
+                    (Some(existing), None) => live_merge::merge_json_live(
+                        app_type,
+                        "proxy live backup",
+                        existing.clone(),
+                        &incoming_snapshot,
+                    )
+                    .map_err(|error| error.to_string()),
+                    (None, _) => Ok(incoming_snapshot),
+                }
+            }
+            AppType::OpenCode | AppType::Hermes | AppType::OpenClaw => Ok(backup_snapshot),
         }
+    }
 
-        self.save_live_backup_snapshot(app_type.as_str(), &backup_snapshot)
-            .await
+    fn merge_codex_live_backup(
+        existing_backup: Option<&Value>,
+        previous_backup_snapshot: Option<&Value>,
+        mut incoming_backup: Value,
+    ) -> Result<Value, String> {
+        let Some(existing_backup) = existing_backup else {
+            return Ok(incoming_backup);
+        };
+
+        let mut merged = existing_backup.clone();
+        let existing_auth = existing_backup
+            .get("auth")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let base_auth = previous_backup_snapshot
+            .and_then(|base| base.get("auth"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let incoming_auth = incoming_backup
+            .get("auth")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let merged_auth = if previous_backup_snapshot.is_some() {
+            live_merge::merge_json_with_base_live(
+                &AppType::Codex,
+                "proxy live backup auth",
+                existing_auth,
+                &base_auth,
+                &incoming_auth,
+            )
+        } else {
+            live_merge::merge_json_live(
+                &AppType::Codex,
+                "proxy live backup auth",
+                existing_auth,
+                &incoming_auth,
+            )
+        }
+        .map_err(|error| error.to_string())?;
+
+        let existing_config = existing_backup
+            .get("config")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let base_config = previous_backup_snapshot
+            .and_then(|base| base.get("config"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let incoming_config = incoming_backup
+            .get("config")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let merged_config = if previous_backup_snapshot.is_some() {
+            live_merge::merge_toml_with_base_live(
+                &AppType::Codex,
+                "proxy live backup config",
+                existing_config,
+                base_config,
+                incoming_config,
+            )
+        } else {
+            live_merge::merge_toml_live(
+                &AppType::Codex,
+                "proxy live backup config",
+                existing_config,
+                incoming_config,
+            )
+        }
+        .map_err(|error| error.to_string())?;
+
+        if let Some(root) = merged.as_object_mut() {
+            root.insert("auth".to_string(), merged_auth);
+            root.insert("config".to_string(), json!(merged_config));
+            if let Some(incoming_root) = incoming_backup.as_object_mut() {
+                for (key, value) in incoming_root {
+                    if key != "auth" && key != "config" && !root.contains_key(key) {
+                        root.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+            Ok(merged)
+        } else {
+            let mut merged_root = serde_json::Map::new();
+            merged_root.insert("auth".to_string(), merged_auth);
+            merged_root.insert("config".to_string(), json!(merged_config));
+            Ok(Value::Object(merged_root))
+        }
     }
 
     pub async fn hot_switch_provider(
@@ -1820,11 +2341,25 @@ impl ProxyService {
             .map_err(|e| format!("读取供应商失败: {e}"))?
             .ok_or_else(|| format!("供应商不存在: {provider_id}"))?;
 
-        let logical_target_changed =
+        let current_provider_id =
             crate::settings::get_effective_current_provider(&self.db, &app_type_enum)
-                .map_err(|e| format!("读取当前供应商失败: {e}"))?
-                .as_deref()
-                != Some(provider_id);
+                .map_err(|e| format!("读取当前供应商失败: {e}"))?;
+        let logical_target_changed = current_provider_id.as_deref() != Some(provider_id);
+        let previous_provider = current_provider_id
+            .as_deref()
+            .filter(|current_id| *current_id != provider_id)
+            .and_then(|current_id| {
+                self.db
+                    .get_provider_by_id(current_id, app_type)
+                    .map_err(|error| {
+                        log::warn!(
+                            "load previous provider {current_id} for {app_type} failed while hot-switching: {error}"
+                        );
+                        error
+                    })
+                    .ok()
+                    .flatten()
+            });
 
         let has_backup = self
             .db
@@ -1833,7 +2368,7 @@ impl ProxyService {
             .map_err(|e| format!("读取 {app_type} 备份失败: {e}"))?
             .is_some();
         let live_taken_over = self.detect_takeover_in_live_config_for_app(&app_type_enum);
-        let should_sync_backup = has_backup || live_taken_over;
+        let should_sync_live = has_backup || live_taken_over;
 
         self.db
             .set_current_provider(app_type_enum.as_str(), provider_id)
@@ -1841,14 +2376,18 @@ impl ProxyService {
         crate::settings::set_current_provider(&app_type_enum, Some(provider_id))
             .map_err(|e| format!("更新本地当前供应商失败: {e}"))?;
 
-        if should_sync_backup {
-            self.update_live_backup_from_provider(app_type, &provider)
+        if should_sync_live {
+            let backup_snapshot = self
+                .prepare_live_backup_from_provider(
+                    app_type_enum.as_str(),
+                    &provider,
+                    previous_provider.as_ref(),
+                )
                 .await?;
-
-            if matches!(app_type_enum, AppType::Claude) {
-                self.sync_claude_live_from_provider_while_proxy_active(&provider)
-                    .await?;
-            }
+            self.save_live_backup_snapshot(app_type_enum.as_str(), &backup_snapshot)
+                .await?;
+            self.write_failover_live_snapshot_for_provider(&app_type_enum, &provider)
+                .await?;
         }
 
         if let Some(server) = self.runtime.server.read().await.as_ref() {
@@ -1893,63 +2432,6 @@ impl ProxyService {
             log::debug!("代理模式：{app_type} 已对齐到目标供应商 {provider_id}");
         }
 
-        Ok(())
-    }
-
-    fn preserve_codex_mcp_servers_in_backup(
-        target_settings: &mut Value,
-        existing_backup: &Value,
-    ) -> Result<(), String> {
-        let target_obj = target_settings
-            .as_object_mut()
-            .ok_or_else(|| "Codex live backup must be a JSON object".to_string())?;
-
-        let target_config = target_obj
-            .get("config")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let mut target_doc = if target_config.trim().is_empty() {
-            toml_edit::DocumentMut::new()
-        } else {
-            target_config
-                .parse::<toml_edit::DocumentMut>()
-                .map_err(|error| format!("parse new Codex config.toml failed: {error}"))?
-        };
-
-        let existing_config = existing_backup
-            .get("config")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if existing_config.trim().is_empty() {
-            target_obj.insert("config".to_string(), json!(target_doc.to_string()));
-            return Ok(());
-        }
-
-        let existing_doc = existing_config
-            .parse::<toml_edit::DocumentMut>()
-            .map_err(|error| format!("parse existing Codex backup failed: {error}"))?;
-
-        if let Some(existing_mcp_servers) = existing_doc.get("mcp_servers") {
-            match target_doc.get_mut("mcp_servers") {
-                Some(target_mcp_servers) => {
-                    if let (Some(target_table), Some(existing_table)) = (
-                        target_mcp_servers.as_table_like_mut(),
-                        existing_mcp_servers.as_table_like(),
-                    ) {
-                        for (server_id, server_item) in existing_table.iter() {
-                            if target_table.get(server_id).is_none() {
-                                target_table.insert(server_id, server_item.clone());
-                            }
-                        }
-                    }
-                }
-                None => {
-                    target_doc["mcp_servers"] = existing_mcp_servers.clone();
-                }
-            }
-        }
-
-        target_obj.insert("config".to_string(), json!(target_doc.to_string()));
         Ok(())
     }
 
@@ -2082,7 +2564,10 @@ impl ProxyService {
         self.validate_app_proxy_activation(app_type, fallback_provider_id)
             .await?;
 
-        if !runtime_already_known && !self.is_running().await {
+        if !runtime_already_known
+            && !self.has_running_foreground_runtime().await
+            && !self.has_managed_worker_for_app(app_type).await
+        {
             let config = self.runtime_config_for_app(app_type).await?;
             self.start_with_resolved_config_unlocked(config).await?;
         }
@@ -2169,6 +2654,8 @@ impl ProxyService {
 
         if !app_proxy.enabled && !has_backup && !live_taken_over {
             self.clear_app_proxy_routing_flags(app_proxy).await?;
+            self.delete_failover_live_snapshots_for_app(app_type)
+                .await?;
             return Ok(());
         }
 
@@ -2183,6 +2670,8 @@ impl ProxyService {
         }
 
         self.clear_app_proxy_routing_flags(app_proxy).await?;
+        self.delete_failover_live_snapshots_for_app(app_type)
+            .await?;
 
         self.db
             .clear_provider_health_for_app(app_key)
@@ -2860,10 +3349,10 @@ impl ProxyService {
             .ok_or_else(|| "Codex config missing auth field".to_string())?;
         let config_text = config.get("config").and_then(Value::as_str);
         let mut settings = config.clone();
-        if !settings
+        if settings
             .get("modelCatalog")
             .and_then(|catalog| catalog.get("models"))
-            .is_some()
+            .is_none()
         {
             if let Some(root) = settings.as_object_mut() {
                 root.insert(
@@ -2896,10 +3385,10 @@ impl ProxyService {
             .ok_or_else(|| "Codex config missing auth field".to_string())?;
         let config_text = config.get("config").and_then(Value::as_str);
         let mut settings = config.clone();
-        if !settings
+        if settings
             .get("modelCatalog")
             .and_then(|catalog| catalog.get("models"))
-            .is_some()
+            .is_none()
         {
             if let Some(root) = settings.as_object_mut() {
                 root.insert(
@@ -3194,7 +3683,7 @@ impl ProxyService {
         #[cfg(unix)]
         {
             let rc = unsafe { libc::kill(pid as i32, 0) };
-            return rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+            rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
         }
 
         #[cfg(not(unix))]
@@ -3297,7 +3786,7 @@ impl ProxyService {
         if status.port == 0 {
             status.port = session.port;
         }
-        ExternalProxyStatusProbe::Matched(status)
+        ExternalProxyStatusProbe::Matched(Box::new(status))
     }
 
     fn build_session_status_url(session: &PersistedProxyRuntimeSession) -> String {
@@ -3354,10 +3843,10 @@ impl ProxyService {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
 
-            return Err(format!(
+            Err(format!(
                 "managed proxy session did not exit after termination signal: pid {}",
                 pid
-            ));
+            ))
         }
 
         #[cfg(not(unix))]
@@ -3787,6 +4276,10 @@ mod tests {
             Response, TakeoverFlags, WorkerRuntimeStatus, WorkerState, WorkerTargetState,
         };
 
+        #[expect(
+            clippy::too_many_arguments,
+            reason = "test fixture builder mirrors worker status fields"
+        )]
         fn worker(
             app_type: &str,
             port: u16,
@@ -4104,7 +4597,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn enable_auto_failover_for_app_switches_to_queue_head() {
+    async fn enable_auto_failover_for_app_switches_to_queue_head_and_generates_snapshots() {
         let temp_home = TempDir::new().expect("create temp home");
         let _env = TestHomeEnvGuard::set(temp_home.path());
 
@@ -4124,10 +4617,19 @@ mod tests {
             None,
         );
         provider_b.sort_index = Some(1);
+        let mut provider_c = Provider::with_id(
+            "provider-c".to_string(),
+            "Provider C".to_string(),
+            json!({"env":{"ANTHROPIC_BASE_URL":"https://c.example","ANTHROPIC_AUTH_TOKEN":"c"}}),
+            None,
+        );
+        provider_c.sort_index = Some(3);
         db.save_provider("claude", &provider_a)
             .expect("save provider a");
         db.save_provider("claude", &provider_b)
             .expect("save provider b");
+        db.save_provider("claude", &provider_c)
+            .expect("save provider c");
         db.set_current_provider("claude", &provider_a.id)
             .expect("set current provider");
         crate::settings::set_current_provider(&AppType::Claude, Some(&provider_a.id))
@@ -4136,6 +4638,18 @@ mod tests {
             .expect("queue provider b");
         db.add_to_failover_queue("claude", &provider_a.id)
             .expect("queue provider a");
+        db.add_to_failover_queue("claude", &provider_c.id)
+            .expect("queue provider c");
+        let original_live = json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://local.example",
+                "ANTHROPIC_AUTH_TOKEN": "local",
+                "LOCAL_ONLY": "kept"
+            }
+        });
+        db.save_live_backup("claude", &original_live.to_string())
+            .await
+            .expect("seed original live backup");
         let (_server, port) = spawn_status_server_for_test("claude-test-token").await;
         seed_managed_worker_for_app(db.as_ref(), "claude", port);
 
@@ -4161,6 +4675,63 @@ mod tests {
                 .as_deref(),
             Some("provider-b")
         );
+
+        let backup = db
+            .get_live_backup("claude")
+            .await
+            .expect("get original live backup")
+            .expect("backup exists");
+        let stored_backup: Value =
+            serde_json::from_str(&backup.original_config).expect("parse original live backup");
+        assert_eq!(
+            stored_backup
+                .pointer("/env/ANTHROPIC_BASE_URL")
+                .and_then(Value::as_str),
+            Some("https://b.example"),
+            "enabling auto-failover should refresh the restore backup to the queue head"
+        );
+        assert_eq!(
+            stored_backup
+                .pointer("/env/ANTHROPIC_AUTH_TOKEN")
+                .and_then(Value::as_str),
+            Some("b")
+        );
+        assert_eq!(
+            stored_backup
+                .pointer("/env/LOCAL_ONLY")
+                .and_then(Value::as_str),
+            Some("kept")
+        );
+
+        for (provider_id, token, base_url) in [
+            ("provider-a", "a", "https://a.example"),
+            ("provider-b", "b", "https://b.example"),
+            ("provider-c", "c", "https://c.example"),
+        ] {
+            let snapshot = db
+                .get_failover_live_snapshot("claude", provider_id)
+                .await
+                .expect("get failover snapshot")
+                .unwrap_or_else(|| panic!("snapshot exists for {provider_id}"));
+            let stored: Value =
+                serde_json::from_str(&snapshot.config_json).expect("parse failover snapshot");
+            assert_eq!(
+                stored
+                    .pointer("/env/ANTHROPIC_AUTH_TOKEN")
+                    .and_then(Value::as_str),
+                Some(token)
+            );
+            assert_eq!(
+                stored
+                    .pointer("/env/ANTHROPIC_BASE_URL")
+                    .and_then(Value::as_str),
+                Some(base_url)
+            );
+            assert_eq!(
+                stored.pointer("/env/LOCAL_ONLY").and_then(Value::as_str),
+                Some("kept")
+            );
+        }
     }
 
     #[tokio::test]
@@ -4198,6 +4769,116 @@ mod tests {
             .await
             .expect("load claude proxy config");
         assert!(!config.auto_failover_enabled);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn enable_proxy_and_auto_failover_rolls_back_takeover_when_managed_session_start_fails() {
+        let temp_home = TempDir::new().expect("create temp home");
+        let _env = TestHomeEnvGuard::set(temp_home.path());
+        std::fs::create_dir_all(
+            get_claude_settings_path()
+                .parent()
+                .expect("claude settings parent dir"),
+        )
+        .expect("create ~/.claude");
+        let original_live = json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://local.example",
+                "ANTHROPIC_AUTH_TOKEN": "local-token",
+                "LOCAL_ONLY": "kept"
+            }
+        });
+        write_json_file(&get_claude_settings_path(), &original_live)
+            .expect("seed claude live config");
+
+        let db = Arc::new(Database::memory().expect("create database"));
+        let service = ProxyService::new(db.clone());
+        use_ephemeral_app_proxy_port(db.as_ref(), "claude");
+        let previous_provider = Provider::with_id(
+            "previous".to_string(),
+            "Previous".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://previous.example",
+                    "ANTHROPIC_AUTH_TOKEN": "previous-token"
+                }
+            }),
+            None,
+        );
+        let provider = Provider::with_id(
+            "queue-head".to_string(),
+            "Queue Head".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://queue.example",
+                    "ANTHROPIC_AUTH_TOKEN": "queue-token"
+                }
+            }),
+            None,
+        );
+        db.save_provider("claude", &previous_provider)
+            .expect("save previous provider");
+        db.save_provider("claude", &provider)
+            .expect("save queued provider");
+        db.set_current_provider("claude", &previous_provider.id)
+            .expect("set previous database current provider");
+        crate::settings::set_current_provider(&AppType::Claude, Some(&previous_provider.id))
+            .expect("set previous local current provider");
+        db.add_to_failover_queue("claude", &provider.id)
+            .expect("queue provider");
+
+        let mut runtime_config = service.get_config().await.expect("get proxy config");
+        runtime_config.listen_port = 0;
+        service
+            .start_with_runtime_config(runtime_config)
+            .await
+            .expect("start foreground proxy runtime");
+
+        let error = service
+            .enable_proxy_and_auto_failover_for_app("claude")
+            .await
+            .expect_err("managed session start should fail while foreground runtime is active");
+
+        assert!(
+            error.contains("proxy is already running in foreground mode"),
+            "{error}"
+        );
+        service.stop().await.expect("stop foreground proxy runtime");
+
+        let live: Value =
+            read_json_file(&get_claude_settings_path()).expect("read restored claude live config");
+        assert_eq!(live, original_live);
+        assert!(
+            db.get_live_backup("claude")
+                .await
+                .expect("load claude live backup")
+                .is_none(),
+            "rollback should remove temporary live backup"
+        );
+        assert!(
+            db.list_failover_live_snapshots("claude")
+                .await
+                .expect("list failover snapshots")
+                .is_empty(),
+            "rollback should clear generated failover snapshots"
+        );
+        let config = db
+            .get_proxy_config_for_app("claude")
+            .await
+            .expect("load claude proxy config");
+        assert!(!config.enabled);
+        assert!(!config.auto_failover_enabled);
+        assert_eq!(
+            db.get_current_provider("claude")
+                .expect("load database current provider")
+                .as_deref(),
+            Some("previous")
+        );
+        assert_eq!(
+            crate::settings::get_current_provider(&AppType::Claude).as_deref(),
+            Some("previous")
+        );
     }
 
     #[tokio::test]
@@ -4357,12 +5038,12 @@ mod tests {
         db.add_to_failover_queue("claude", &provider.id)
             .expect("queue provider");
 
-        let app_type = service
+        let activation = service
             .prepare_proxy_and_auto_failover_activation("claude")
             .await
             .expect("prepare proxy and auto failover activation");
 
-        assert_eq!(app_type, AppType::Claude);
+        assert_eq!(activation.app_type, AppType::Claude);
         assert_eq!(
             crate::settings::get_effective_current_provider(db.as_ref(), &AppType::Claude)
                 .expect("load effective current provider")
@@ -6509,7 +7190,7 @@ wire_api = "responses"
 
     #[tokio::test]
     #[serial]
-    async fn hot_switch_codex_provider_preserves_provider_model_provider_in_backup_and_restore() {
+    async fn hot_switch_codex_provider_refreshes_restore_backup_to_selected_provider() {
         let temp_home = TempDir::new().expect("create temp home");
         let _env = TestHomeEnvGuard::set(temp_home.path());
 
@@ -6563,9 +7244,24 @@ requires_openai_auth = true
             .expect("set current provider");
         crate::settings::set_current_provider(&AppType::Codex, Some("a"))
             .expect("set local current provider");
+        let original_backup = json!({
+            "auth": {
+                "OPENAI_API_KEY": "rightcode-key"
+            },
+            "config": r#"model_provider = "rightcode"
+model = "gpt-5.4"
+local_only = "kept"
+
+[model_providers.rightcode]
+name = "RightCode"
+base_url = "https://rightcode.example/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"#
+        });
         db.save_live_backup(
             "codex",
-            &serde_json::to_string(&provider_a.settings_config).expect("serialize provider a"),
+            &serde_json::to_string(&original_backup).expect("serialize provider a"),
         )
         .await
         .expect("seed live backup");
@@ -6596,9 +7292,17 @@ requires_openai_auth = true
             .await
             .expect("get live backup")
             .expect("backup exists");
-        let stored: Value =
+        let stored_backup: Value =
             serde_json::from_str(&backup.original_config).expect("parse backup json");
-        let backup_config = stored
+        assert_eq!(
+            stored_backup
+                .get("auth")
+                .and_then(|auth| auth.get("OPENAI_API_KEY"))
+                .and_then(Value::as_str),
+            Some("aihubmix-key"),
+            "hot switch should refresh the restore backup auth to the selected provider"
+        );
+        let backup_config = stored_backup
             .get("config")
             .and_then(Value::as_str)
             .expect("backup config string");
@@ -6607,25 +7311,69 @@ requires_openai_auth = true
         assert_eq!(
             parsed_backup.get("model_provider").and_then(|v| v.as_str()),
             Some("aihubmix"),
-            "provider-derived restore backup should preserve the selected provider template"
+            "hot switch should refresh the restore backup config to the selected provider"
+        );
+        assert_eq!(
+            parsed_backup.get("local_only").and_then(|v| v.as_str()),
+            Some("kept"),
+            "hot switch should preserve local-only live backup fields while refreshing provider-owned fields"
         );
         let backup_model_providers = parsed_backup
             .get("model_providers")
             .and_then(|v| v.as_table())
             .expect("backup model_providers");
+        assert!(
+            backup_model_providers.get("rightcode").is_none(),
+            "hot switch should remove stale provider-owned config sections from the restore backup"
+        );
         assert_eq!(
             backup_model_providers
                 .get("aihubmix")
                 .and_then(|v| v.get("base_url"))
                 .and_then(|v| v.as_str()),
             Some("https://aihubmix.example/v1"),
-            "selected provider id should point at the hot-switched provider endpoint"
+            "hot switch should keep the selected provider config section in the restore backup"
         );
 
-        service
-            .restore_live_config_for_app(&AppType::Codex)
+        let snapshot = db
+            .get_failover_live_snapshot("codex", "b")
             .await
-            .expect("restore Codex live config");
+            .expect("get Codex failover snapshot")
+            .expect("snapshot exists");
+        let stored: Value =
+            serde_json::from_str(&snapshot.config_json).expect("parse snapshot json");
+        assert_eq!(
+            stored
+                .get("auth")
+                .and_then(|auth| auth.get("OPENAI_API_KEY"))
+                .and_then(Value::as_str),
+            Some("aihubmix-key")
+        );
+        let snapshot_config = stored
+            .get("config")
+            .and_then(Value::as_str)
+            .expect("snapshot config string");
+        let parsed_snapshot: toml::Value =
+            toml::from_str(snapshot_config).expect("parse snapshot config");
+        assert_eq!(
+            parsed_snapshot
+                .get("model_provider")
+                .and_then(|v| v.as_str()),
+            Some("aihubmix"),
+            "provider-derived snapshot should preserve the selected provider template"
+        );
+        let snapshot_model_providers = parsed_snapshot
+            .get("model_providers")
+            .and_then(|v| v.as_table())
+            .expect("snapshot model_providers");
+        assert_eq!(
+            snapshot_model_providers
+                .get("aihubmix")
+                .and_then(|v| v.get("base_url"))
+                .and_then(|v| v.as_str()),
+            Some("https://aihubmix.example/v1"),
+            "selected provider id should point at the hot-switched provider endpoint"
+        );
 
         let live = service.read_codex_live().expect("read Codex live config");
         let live_config = live
@@ -6636,14 +7384,77 @@ requires_openai_auth = true
         assert_eq!(
             parsed_live.get("model_provider").and_then(|v| v.as_str()),
             Some("aihubmix"),
-            "restored Codex live config should preserve the hot-switched provider template"
+            "active Codex live config should use the hot-switched provider snapshot"
         );
         assert_eq!(
             live.get("auth")
                 .and_then(|auth| auth.get("OPENAI_API_KEY"))
                 .and_then(Value::as_str),
+            Some(PROXY_TOKEN_PLACEHOLDER),
+            "active live auth should be proxy-managed during takeover"
+        );
+        let live_model_providers = parsed_live
+            .get("model_providers")
+            .and_then(|v| v.as_table())
+            .expect("live model_providers");
+        assert!(
+            live_model_providers
+                .get("aihubmix")
+                .and_then(|v| v.get("base_url"))
+                .and_then(|v| v.as_str())
+                .is_some_and(crate::services::proxy::codex_toml::is_loopback_proxy_url),
+            "active live provider endpoint should be rewritten to the local proxy"
+        );
+
+        service
+            .restore_live_config_for_app(&AppType::Codex)
+            .await
+            .expect("restore Codex live config");
+
+        let restored = service
+            .read_codex_live()
+            .expect("read restored Codex live config");
+        let restored_config = restored
+            .get("config")
+            .and_then(Value::as_str)
+            .expect("restored config string");
+        let parsed_restored: toml::Value =
+            toml::from_str(restored_config).expect("parse restored config");
+        assert_eq!(
+            parsed_restored
+                .get("model_provider")
+                .and_then(|v| v.as_str()),
+            Some("aihubmix"),
+            "restore should use the hot-switched provider backup"
+        );
+        assert_eq!(
+            parsed_restored.get("local_only").and_then(|v| v.as_str()),
+            Some("kept"),
+            "restore should preserve local-only live backup fields"
+        );
+        let restored_model_providers = parsed_restored
+            .get("model_providers")
+            .and_then(|v| v.as_table())
+            .expect("restored model_providers");
+        assert!(
+            restored_model_providers.get("rightcode").is_none(),
+            "restore should not bring back stale provider-owned config sections"
+        );
+        assert_eq!(
+            restored_model_providers
+                .get("aihubmix")
+                .and_then(|v| v.get("base_url"))
+                .and_then(|v| v.as_str()),
+            Some("https://aihubmix.example/v1"),
+            "restore should keep the selected provider config section"
+        );
+        assert_eq!(
+            restored
+                .get("auth")
+                .and_then(|auth| auth.get("OPENAI_API_KEY"))
+                .and_then(Value::as_str),
             Some("aihubmix-key"),
-            "restore should still use the hot-switched provider auth"
+            "restore should use the hot-switched provider backup auth"
         );
     }
 
@@ -6715,6 +7526,126 @@ requires_openai_auth = true
         assert!(
             stored.get("config").is_none(),
             "Gemini live backup should not snapshot settings.json/config; upstream keeps only env"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn hot_switch_gemini_provider_refreshes_restore_backup_to_selected_provider() {
+        let temp_home = TempDir::new().expect("create temp home");
+        let _env = TestHomeEnvGuard::set(temp_home.path());
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+
+        let provider_a = Provider::with_id(
+            "a".to_string(),
+            "A".to_string(),
+            json!({
+                "env": {
+                    "GEMINI_API_KEY": "a-key"
+                }
+            }),
+            None,
+        );
+        let provider_b = Provider::with_id(
+            "b".to_string(),
+            "B".to_string(),
+            json!({
+                "env": {
+                    "GEMINI_API_KEY": "b-key"
+                },
+                "config": {
+                    "theme": "selected"
+                }
+            }),
+            None,
+        );
+        db.save_provider("gemini", &provider_a)
+            .expect("save provider a");
+        db.save_provider("gemini", &provider_b)
+            .expect("save provider b");
+        db.set_current_provider("gemini", "a")
+            .expect("set current provider");
+        crate::settings::set_current_provider(&AppType::Gemini, Some("a"))
+            .expect("set local current provider");
+        db.save_live_backup(
+            "gemini",
+            r#"{"env":{"GEMINI_API_KEY":"a-key","LOCAL_ONLY":"kept"}}"#,
+        )
+        .await
+        .expect("seed live backup");
+        service
+            .write_gemini_live(&json!({
+                "env": {
+                    "GOOGLE_GEMINI_BASE_URL": "http://127.0.0.1:15723",
+                    "GEMINI_API_KEY": PROXY_TOKEN_PLACEHOLDER
+                }
+            }))
+            .expect("seed taken-over Gemini live config");
+
+        service
+            .hot_switch_provider("gemini", "b")
+            .await
+            .expect("hot switch Gemini provider");
+
+        let backup = db
+            .get_live_backup("gemini")
+            .await
+            .expect("get live backup")
+            .expect("backup exists");
+        let stored_backup: Value =
+            serde_json::from_str(&backup.original_config).expect("parse backup json");
+        assert_eq!(
+            stored_backup
+                .pointer("/env/GEMINI_API_KEY")
+                .and_then(Value::as_str),
+            Some("b-key"),
+            "hot switch should refresh Gemini restore backup to the selected provider"
+        );
+        assert_eq!(
+            stored_backup
+                .pointer("/env/LOCAL_ONLY")
+                .and_then(Value::as_str),
+            Some("kept"),
+            "hot switch should preserve local-only Gemini backup values"
+        );
+        assert!(
+            stored_backup.get("config").is_none(),
+            "Gemini restore backup should keep only env data"
+        );
+
+        let live = service.read_gemini_live().expect("read Gemini live config");
+        assert_eq!(
+            live.pointer("/env/GEMINI_API_KEY").and_then(Value::as_str),
+            Some(PROXY_TOKEN_PLACEHOLDER),
+            "active Gemini live config should remain proxy-managed during takeover"
+        );
+        assert_eq!(
+            live.pointer("/env/GOOGLE_GEMINI_BASE_URL")
+                .and_then(Value::as_str),
+            Some("http://127.0.0.1:15723"),
+            "active Gemini live config should keep the proxy base URL"
+        );
+
+        service
+            .restore_live_config_for_app(&AppType::Gemini)
+            .await
+            .expect("restore Gemini live config");
+        let restored = service
+            .read_gemini_live()
+            .expect("read restored Gemini live config");
+        assert_eq!(
+            restored
+                .pointer("/env/GEMINI_API_KEY")
+                .and_then(Value::as_str),
+            Some("b-key"),
+            "restore should use the hot-switched Gemini provider backup"
+        );
+        assert_eq!(
+            restored.pointer("/env/LOCAL_ONLY").and_then(Value::as_str),
+            Some("kept"),
+            "restore should preserve local-only Gemini backup values"
         );
     }
 
@@ -6826,11 +7757,22 @@ requires_openai_auth = true
 
     #[tokio::test]
     #[serial]
-    async fn switch_proxy_target_updates_live_backup_when_taken_over() {
+    async fn switch_proxy_target_refreshes_restore_backup_to_selected_provider() {
         let temp_home = TempDir::new().expect("create temp home");
         let _env = TestHomeEnvGuard::set(temp_home.path());
 
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("reserve free local port");
+        let preferred_port = listener
+            .local_addr()
+            .expect("read reserved listener address")
+            .port();
+        drop(listener);
+
         let db = Arc::new(Database::memory().expect("init db"));
+        db.set_app_proxy_preferred_port("claude", preferred_port)
+            .expect("persist claude preferred proxy port");
         let service = ProxyService::new(db.clone());
 
         let provider_a = Provider::with_id(
@@ -6859,8 +7801,11 @@ requires_openai_auth = true
             .expect("save provider b");
         db.set_current_provider("claude", "a")
             .expect("set current provider");
+        crate::settings::set_current_provider(&AppType::Claude, Some("a"))
+            .expect("set settings current provider");
 
-        db.save_live_backup("claude", "{\"env\":{}}")
+        let original_live = json!({"env":{"LOCAL_ONLY":"kept"}});
+        db.save_live_backup("claude", &original_live.to_string())
             .await
             .expect("seed live backup");
 
@@ -6879,8 +7824,52 @@ requires_openai_auth = true
             .await
             .expect("get live backup")
             .expect("backup exists");
-        let expected = serde_json::to_string(&provider_b.settings_config).expect("serialize");
-        assert_eq!(backup.original_config, expected);
+        let stored_backup: Value =
+            serde_json::from_str(&backup.original_config).expect("parse live backup");
+        assert_eq!(
+            stored_backup
+                .pointer("/env/ANTHROPIC_API_KEY")
+                .and_then(Value::as_str),
+            Some("b-key"),
+            "switching proxy target should refresh the restore backup to the selected provider"
+        );
+        assert_eq!(
+            stored_backup
+                .pointer("/env/LOCAL_ONLY")
+                .and_then(Value::as_str),
+            Some("kept"),
+            "switching proxy target should preserve local-only backup values"
+        );
+
+        let snapshot = db
+            .get_failover_live_snapshot("claude", "b")
+            .await
+            .expect("get failover snapshot")
+            .expect("snapshot exists");
+        let stored_snapshot: Value =
+            serde_json::from_str(&snapshot.config_json).expect("parse failover snapshot");
+        assert_eq!(
+            stored_snapshot
+                .pointer("/env/ANTHROPIC_API_KEY")
+                .and_then(Value::as_str),
+            Some("b-key")
+        );
+        assert_eq!(
+            stored_snapshot
+                .pointer("/env/LOCAL_ONLY")
+                .and_then(Value::as_str),
+            Some("kept")
+        );
+
+        let live = service.read_claude_live().expect("read Claude live config");
+        let env = env_object(&live);
+        assert_env_str(
+            env,
+            "ANTHROPIC_BASE_URL",
+            Some(format!("http://127.0.0.1:{preferred_port}").as_str()),
+        );
+        assert_env_str(env, "ANTHROPIC_API_KEY", Some(PROXY_TOKEN_PLACEHOLDER));
+        assert_env_str(env, "LOCAL_ONLY", Some("kept"));
     }
 
     #[tokio::test]

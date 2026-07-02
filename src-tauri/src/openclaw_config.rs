@@ -1,6 +1,7 @@
-use crate::config::{atomic_write, get_app_config_dir, home_dir};
+use crate::config::{atomic_write, create_managed_config_dir_all, get_app_config_dir, home_dir};
 use crate::error::AppError;
 use crate::provider::OpenClawProviderConfig;
+use crate::services::provider::live_merge;
 use crate::settings::{effective_backup_retain_count, get_openclaw_override_dir};
 use chrono::Local;
 use indexmap::IndexMap;
@@ -233,7 +234,7 @@ impl OpenClawConfigDocument {
 
         if let Some(existing) = key_value_pairs
             .iter_mut()
-            .find(|pair| json5_key_name(&pair.key).as_deref() == Some(key))
+            .find(|pair| json5_key_name(&pair.key) == Some(key))
         {
             existing.value = new_value;
             return Ok(());
@@ -326,7 +327,7 @@ fn write_root_section(section: &str, value: &Value) -> Result<OpenClawWriteOutco
 
 fn create_openclaw_backup(source: &str) -> Result<PathBuf, AppError> {
     let backup_dir = get_app_config_dir().join("backups").join("openclaw");
-    fs::create_dir_all(&backup_dir).map_err(|e| AppError::io(&backup_dir, e))?;
+    create_managed_config_dir_all(&backup_dir)?;
 
     let base_id = format!("openclaw_{}", Local::now().format("%Y%m%d_%H%M%S"));
     let mut filename = format!("{base_id}.json5");
@@ -720,6 +721,7 @@ pub fn get_provider(id: &str) -> Result<Option<Value>, AppError> {
     Ok(get_providers()?.get(id).cloned())
 }
 
+#[allow(dead_code)]
 pub fn set_provider(id: &str, provider_config: Value) -> Result<OpenClawWriteOutcome, AppError> {
     let mut full_config = read_openclaw_config()?;
     {
@@ -743,6 +745,44 @@ pub fn set_provider(id: &str, provider_config: Value) -> Result<OpenClawWriteOut
         })
     });
     write_root_section("models", &models_value)
+}
+
+pub fn prepare_provider(id: &str, provider_config: Value) -> Result<Value, AppError> {
+    let mut full_config = read_openclaw_config()?;
+    {
+        let root = ensure_object(&mut full_config);
+        let models = root.entry("models".to_string()).or_insert_with(|| {
+            json!({
+                "mode": "merge",
+                "providers": {}
+            })
+        });
+        let providers = ensure_object(models)
+            .entry("providers".to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        let providers = ensure_object(providers);
+        let merged = match providers.get(id) {
+            Some(existing) => live_merge::merge_json_live(
+                &crate::app_config::AppType::OpenClaw,
+                format!("openclaw.json models.providers.{id}"),
+                existing.clone(),
+                &provider_config,
+            )?,
+            None => provider_config,
+        };
+        providers.insert(id.to_string(), merged);
+    }
+
+    Ok(full_config.get("models").cloned().unwrap_or_else(|| {
+        json!({
+            "mode": "merge",
+            "providers": {}
+        })
+    }))
+}
+
+pub fn write_prepared_models(models_value: &Value) -> Result<OpenClawWriteOutcome, AppError> {
+    write_root_section("models", models_value)
 }
 
 pub fn remove_provider(id: &str) -> Result<OpenClawWriteOutcome, AppError> {
@@ -815,6 +855,7 @@ pub fn get_typed_providers() -> Result<IndexMap<String, OpenClawProviderConfig>,
     Ok(result)
 }
 
+#[allow(dead_code)]
 pub fn set_typed_provider(
     id: &str,
     config: &OpenClawProviderConfig,
@@ -822,6 +863,15 @@ pub fn set_typed_provider(
     let value =
         serde_json::to_value(config).map_err(|source| AppError::JsonSerialize { source })?;
     set_provider(id, value)
+}
+
+pub fn prepare_typed_provider(
+    id: &str,
+    config: &OpenClawProviderConfig,
+) -> Result<Value, AppError> {
+    let value =
+        serde_json::to_value(config).map_err(|source| AppError::JsonSerialize { source })?;
+    prepare_provider(id, value)
 }
 
 #[allow(dead_code)]
@@ -962,8 +1012,10 @@ mod tests {
     impl SettingsGuard {
         fn with_openclaw_dir(path: &std::path::Path) -> Self {
             let previous = get_settings();
-            let mut settings = AppSettings::default();
-            settings.openclaw_config_dir = Some(path.display().to_string());
+            let settings = AppSettings {
+                openclaw_config_dir: Some(path.display().to_string()),
+                ..Default::default()
+            };
             update_settings(settings).expect("set openclaw override dir");
             Self { previous }
         }
@@ -1577,6 +1629,7 @@ mod tests {
 
     #[test]
     #[serial(home_settings)]
+    #[allow(clippy::needless_update)]
     fn backup_cleanup_uses_settings_retain_count() {
         let _guard = lock_test_home_and_settings();
         let dir = tempdir().expect("create tempdir");
@@ -1585,9 +1638,11 @@ mod tests {
         let _home = HomeGuard::set(dir.path());
 
         let previous = get_settings();
-        let mut settings = AppSettings::default();
-        settings.openclaw_config_dir = Some(openclaw_dir.display().to_string());
-        settings.backup_retain_count = Some(2);
+        let settings = AppSettings {
+            openclaw_config_dir: Some(openclaw_dir.display().to_string()),
+            backup_retain_count: Some(2),
+            ..Default::default()
+        };
         update_settings(settings).expect("set settings with backup retain count");
 
         fs::write(

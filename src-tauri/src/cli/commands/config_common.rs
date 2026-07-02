@@ -185,7 +185,7 @@ fn canonical_common_snippet(app_type: AppType, raw: &str) -> Result<Option<Strin
         | AppType::OpenCode
         | AppType::Hermes
         | AppType::OpenClaw => {
-            let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+            let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
                 AppError::InvalidInput(texts::tui_toast_invalid_json(&e.to_string()))
             })?;
             if !value.is_object() {
@@ -317,7 +317,7 @@ fn extract(
 
 fn clear(app_type: AppType, _apply: bool) -> Result<(), AppError> {
     let state = get_state()?;
-    ProviderService::clear_common_config_snippet(&state, app_type.clone())?;
+    ProviderService::set_common_config_snippet(&state, app_type.clone(), None)?;
 
     println!(
         "{}",
@@ -389,11 +389,12 @@ mod tests {
             &get_claude_settings_path(),
             &json!({
                 "env": {
-                    "ANTHROPIC_BASE_URL": "https://stale.example"
+                    "ANTHROPIC_BASE_URL": "https://provider.example",
+                    "LOCAL_ONLY": "preserve-me"
                 }
             }),
         )
-        .expect("seed stale live settings");
+        .expect("seed live settings");
 
         (temp_home, env)
     }
@@ -678,9 +679,6 @@ mod tests {
 
     #[test]
     fn follow_up_message_is_omitted_for_additive_apps() {
-        assert!(matches!(
-            follow_up_message(AppType::OpenCode, CommonConfigSnippetAction::Set, ""),
-            None
-        ));
+        assert!(follow_up_message(AppType::OpenCode, CommonConfigSnippetAction::Set, "").is_none());
     }
 }

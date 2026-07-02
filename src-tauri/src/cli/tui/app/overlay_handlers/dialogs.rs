@@ -76,6 +76,9 @@ impl App {
                     ConfirmAction::SettingsSetClaudePluginIntegration { enabled } => {
                         Action::SetClaudePluginIntegration { enabled: *enabled }
                     }
+                    ConfirmAction::SettingsSetCodexUnifiedSessionHistory { enabled } => {
+                        Action::SetCodexUnifiedSessionHistory { enabled: *enabled }
+                    }
                     ConfirmAction::VisibleAppsAutoDetection => {
                         Action::ConfirmVisibleAppsAutoDetection { use_auto: true }
                     }
@@ -307,7 +310,11 @@ impl App {
             }
             TextSubmit::SkillsDiscoverQuery => {
                 self.skills_discover_query = raw.clone();
-                Action::SkillsDiscover { query: raw }
+                Action::SkillsDiscover {
+                    query: raw,
+                    source: self.skills_discover_source,
+                    force: false,
+                }
             }
             TextSubmit::SkillsRepoAdd => {
                 if raw.is_empty() {
@@ -483,7 +490,7 @@ impl App {
     ) -> Action {
         if data.proxy.running {
             self.push_toast(
-                texts::tui_toast_proxy_settings_stop_before_edit(),
+                texts::tui_toast_proxy_settings_stop_proxy_before_edit_address(),
                 ToastKind::Info,
             );
             return Action::None;
@@ -509,9 +516,9 @@ impl App {
     }
 
     fn handle_settings_proxy_listen_port_submit(&mut self, data: &UiData, raw: String) -> Action {
-        if data.proxy.running {
+        if data.proxy.has_active_worker_for(&self.app_type) {
             self.push_toast(
-                texts::tui_toast_proxy_settings_stop_before_edit(),
+                texts::tui_toast_proxy_settings_stop_app_route_before_edit_port(),
                 ToastKind::Info,
             );
             return Action::None;

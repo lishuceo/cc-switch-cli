@@ -421,13 +421,30 @@ impl ProviderService {
     /// Aligned with upstream: the stored `settings_config.config` is the full config.toml text.
     /// We write it directly to `~/.codex/config.toml`, optionally merging the common config snippet.
     /// Auth is handled separately via auth.json.
-    pub(super) fn write_codex_live(
+    pub(crate) fn write_codex_live_force(
         provider: &Provider,
         common_config_snippet: Option<&str>,
         apply_common_config: bool,
     ) -> Result<(), AppError> {
-        if !crate::sync_policy::should_sync_live(&AppType::Codex) {
-            return Ok(());
+        let prepared = Self::prepare_codex_live_write(
+            provider,
+            common_config_snippet,
+            None,
+            apply_common_config,
+            true,
+        )?;
+        Self::apply_codex_live_write(&prepared)
+    }
+
+    pub(super) fn prepare_codex_live_write(
+        provider: &Provider,
+        common_config_snippet: Option<&str>,
+        _previous_common_config_snippet: Option<&str>,
+        apply_common_config: bool,
+        force_sync: bool,
+    ) -> Result<PreparedLiveWrite, AppError> {
+        if !force_sync && !crate::sync_policy::should_sync_live(&AppType::Codex) {
+            return Ok(PreparedLiveWrite::Noop);
         }
 
         let effective = Self::build_effective_live_snapshot(
@@ -450,12 +467,74 @@ impl ProviderService {
                 AppError::Config("Codex 供应商配置缺少 'config' 字段或不是字符串".to_string())
             })?;
 
-        crate::codex_config::write_codex_provider_live_with_catalog(
-            &provider.settings_config,
-            Self::codex_live_write_category(provider),
+        let prepared_config =
+            crate::codex_config::prepare_codex_config_text_with_model_catalog_payload(
+                &provider.settings_config,
+                cfg_text,
+            )?;
+        let category = Self::codex_live_write_category(provider);
+        // Mirror upstream write_codex_live_for_provider: official providers with
+        // login material write auth.json; third-party providers write auth.json
+        // unless preserve_codex_official_auth_on_switch is set (then auth.json is
+        // preserved and the API key rides in config.toml's bearer token).
+        let should_write_auth = category == Some("official")
+            || (!force_sync && !crate::settings::preserve_codex_official_auth_on_switch());
+
+        // config.toml is a clean OVERWRITE with the provider's effective config.
+        // When auth.json is preserved (third-party + preserve flag) the API key
+        // is injected into config.toml as an experimental_bearer_token instead.
+        let config_text = if should_write_auth {
+            prepared_config.config_text.clone()
+        } else {
+            crate::codex_config::prepare_codex_provider_live_config(
+                auth,
+                &prepared_config.config_text,
+            )?
+        };
+
+        // auth.json follows Preserve/Write/Delete (no merge): a switch always
+        // prefers the incoming provider's auth, but never clobbers a preserved
+        // ChatGPT OAuth cache when auth is preserved. An empty/null incoming auth
+        // removes the stale live auth.json rather than writing an empty file.
+        let auth = if should_write_auth {
+            if auth.is_null() || auth.as_object().is_some_and(serde_json::Map::is_empty) {
+                PreparedCodexAuthWrite::Delete
+            } else {
+                PreparedCodexAuthWrite::Write(auth.clone())
+            }
+        } else {
+            PreparedCodexAuthWrite::Preserve
+        };
+
+        Ok(PreparedLiveWrite::Codex {
             auth,
-            Some(cfg_text),
-        )?;
+            config: crate::codex_config::PreparedCodexConfigText {
+                config_text,
+                model_catalog: prepared_config.model_catalog,
+            },
+        })
+    }
+
+    pub(super) fn apply_codex_live_write(prepared: &PreparedLiveWrite) -> Result<(), AppError> {
+        let PreparedLiveWrite::Codex { auth, config } = prepared else {
+            return Ok(());
+        };
+
+        crate::codex_config::write_prepared_codex_model_catalog(config)?;
+        match auth {
+            PreparedCodexAuthWrite::Preserve => {
+                crate::codex_config::write_codex_live_config_atomic(Some(&config.config_text))?
+            }
+            PreparedCodexAuthWrite::Write(auth) => {
+                crate::codex_config::write_codex_live_atomic(auth, Some(&config.config_text))?
+            }
+            PreparedCodexAuthWrite::Delete => {
+                crate::codex_config::write_codex_live_atomic_optional_auth(
+                    None,
+                    Some(&config.config_text),
+                )?
+            }
+        }
 
         Ok(())
     }

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use serde_json::json;
 use serial_test::serial;
 use std::ffi::OsString;
@@ -43,7 +45,11 @@ mod claude_mcp {
 }
 
 mod config {
-    use std::path::PathBuf;
+    use serde::Serialize;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use crate::error::AppError;
 
     pub(crate) fn home_dir() -> Option<PathBuf> {
         dirs::home_dir()
@@ -58,6 +64,15 @@ mod config {
         }
 
         home_dir().expect("无法获取用户主目录").join(".cc-switch")
+    }
+
+    pub(crate) fn write_json_file<T: Serialize>(path: &Path, data: &T) -> Result<(), AppError> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
+        }
+        let json = serde_json::to_string_pretty(data)
+            .map_err(|e| AppError::JsonSerialize { source: e })?;
+        fs::write(path, json).map_err(|e| AppError::io(path, e))
     }
 }
 
@@ -499,14 +514,16 @@ fn set_visible_apps_rejects_zero_selection() {
 fn update_settings_rejects_all_false_visible_apps() {
     let _home = HomeGuard::new();
 
-    let mut settings = AppSettings::default();
-    settings.visible_apps = VisibleApps {
-        claude: false,
-        codex: false,
-        gemini: false,
-        opencode: false,
-        openclaw: false,
-        hermes: false,
+    let settings = AppSettings {
+        visible_apps: VisibleApps {
+            claude: false,
+            codex: false,
+            gemini: false,
+            opencode: false,
+            openclaw: false,
+            hermes: false,
+        },
+        ..Default::default()
     };
 
     let err =

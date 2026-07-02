@@ -7,6 +7,105 @@ All notable changes to CC Switch CLI will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.8.5] - 2026-06-25
+
+### Changed
+
+- **Provider / Live Config**: Reworked how provider switching writes the live config. The on-switch config merge added in 5.8.4 is gone — switching now writes the selected provider's config directly and no longer pops "Live configuration conflicts" prompts on a normal switch. Shared, non-provider settings (Claude `hooks` / `permissions` / `statusLine`, Codex shared TOML tables, Gemini proxy env) are carried through the common-config snippet instead of a per-switch merge. Codex `auth.json` keeps its preserve/write/delete handling so switching to a third-party provider no longer clobbers a ChatGPT login cache, and Gemini `settings.json` keeps user `mcpServers`.
+
+### Added
+
+- **Provider / Common Config**: Auto-seed common config snippets from existing live files on first setup for Claude, Codex, and Gemini, so shared settings carry across provider switches out of the box. Skipped once a snippet exists or has been explicitly cleared. [#276](https://github.com/SaladDay/cc-switch-cli/pull/276)
+- **Deeplink**: Add the `deeplink` command to import providers, MCP servers, prompts, and skills via `ccswitch://v1/import?...`. [#226](https://github.com/SaladDay/cc-switch-cli/pull/226)
+- **Codex / TUI**: Add a unified Codex session history setting.
+
+### Fixed
+
+- **Provider / Codex**: Fix config corruption when switching Codex providers, where the previous provider's API URL/key leaked into the newly selected provider's config. Fixes [#303](https://github.com/SaladDay/cc-switch-cli/issues/303), and the spurious "Live configuration conflicts" prompt on a normal switch. Fixes [#287](https://github.com/SaladDay/cc-switch-cli/issues/287).
+- **Provider / Claude**: Stop CC-Switch internal-only fields (`api_format` and friends) from leaking into Claude Code's live `settings.json`.
+- **Proxy / Takeover**: Refresh the takeover backup on hot-switch. [#295](https://github.com/SaladDay/cc-switch-cli/pull/295)
+- **Stream Check / Codex**: Probe Codex chat providers by reachability. [#288](https://github.com/SaladDay/cc-switch-cli/pull/288)
+
+### Docs
+
+- **Proxy**: Document the Windows managed-session limitation. [#299](https://github.com/SaladDay/cc-switch-cli/pull/299)
+
+### Performance
+
+- **TUI**: Show the shell before the full data refresh, and move session usage sync off TUI startup for a faster launch.
+
+### Thanks
+
+Thanks to everyone who helped land this release:
+
+- Code & PRs: [@jiawei666](https://github.com/jiawei666), [@LeonardoTan19](https://github.com/LeonardoTan19), [@hutiefang76](https://github.com/hutiefang76), [@unive3sal](https://github.com/unive3sal), [@louisneal](https://github.com/louisneal)
+- Reports & diagnosis behind the provider-switch rework: [@Mang30](https://github.com/Mang30), [@zhongwangninja](https://github.com/zhongwangninja), [@KiBlazer](https://github.com/KiBlazer), [@zj1123581321](https://github.com/zj1123581321), [@xyooz](https://github.com/xyooz), [@louisneal](https://github.com/louisneal)
+
+## [5.8.4] - 2026-06-19
+
+### Added
+
+- **Providers / ClaudeAPI**: Add the ClaudeAPI sponsor preset, logo, and README sponsor copy, with a Claude-only base URL preset at `https://gw.claudeapi.com`.
+- **Codex / Sessions**: Add the upstream-aligned unified Codex session history toggle. When enabled, official Codex subscription sessions can share the `custom` provider bucket with third-party providers, with backup-backed migration and restore support. The setting remains off by default.
+
+### Changed
+
+- **Provider / Live Config**: Merge live provider config updates safely instead of overwriting unrelated local changes, preserving app-specific semantics across Claude, Codex, Gemini, OpenCode, Hermes, and OpenClaw. [#283](https://github.com/SaladDay/cc-switch-cli/pull/283)
+- **OpenCode / Providers**: Preserve and edit provider-level `modalities`, including image-capable provider config blocks. Fixes [#241](https://github.com/SaladDay/cc-switch-cli/issues/241). [#285](https://github.com/SaladDay/cc-switch-cli/pull/285)
+- **TUI / Proxy Settings**: Align proxy listen-port editing with active workers so app-specific ports can be changed while other app proxy workers are running. [#270](https://github.com/SaladDay/cc-switch-cli/pull/270)
+
+### Fixed
+
+- **Auth / Codex OAuth**: Run `cc-switch auth login` polling sleeps inside the Tokio runtime, fixing the `there is no reactor running` panic while waiting for device authorization. Fixes [#271](https://github.com/SaladDay/cc-switch-cli/issues/271).
+- **Proxy / OpenAI Compatibility**: Strip unsupported `cache_control` fields during Anthropic-to-OpenAI conversion, omit `tool_choice` when no tools are sent, and handle truncated Codex chat streams without masking incomplete responses. Closes [#257](https://github.com/SaladDay/cc-switch-cli/issues/257). [#262](https://github.com/SaladDay/cc-switch-cli/pull/262)
+
+### Commits (since v5.8.3)
+
+- 9e77dfca Add ClaudeAPI sponsor preset
+- 15ba2f1d feat(opencode): preserve and edit provider modalities field (#285)
+- e5aaf50a feat(provider): merge live config updates safely (#283)
+- c106a11b fix(tui): align proxy listen port editing with active workers (#270)
+- caf2b240 fix(proxy): strip cache_control from OpenAI conversion, guard tool_choice, handle truncated streams (#262)
+- f661ab1c feat(codex): add unified session history toggle
+- 4008b2b9 fix(auth): run Codex login polling sleep in runtime
+
+### Thanks
+
+- Thanks `@mvanhorn` for the OpenCode modalities support in [#285](https://github.com/SaladDay/cc-switch-cli/pull/285).
+- Thanks `@unive3sal` for the live config merge work in [#283](https://github.com/SaladDay/cc-switch-cli/pull/283).
+- Thanks `@paigeman` for the proxy listen-port TUI alignment in [#270](https://github.com/SaladDay/cc-switch-cli/pull/270).
+- Thanks `@thedavidweng` for the proxy OpenAI conversion and truncated-stream fixes in [#262](https://github.com/SaladDay/cc-switch-cli/pull/262).
+- Thanks `@pantlive` and `@cjpc222` for reporting and confirming the Codex OAuth login panic in [#271](https://github.com/SaladDay/cc-switch-cli/issues/271).
+- Thanks `@farion1231` for the upstream Codex unified-session-history direction this release follows.
+- Thanks ClaudeAPI for sponsoring the project, and thanks `@SaladDay` for the sponsor preset integration, upstream alignment work, issue triage, and release coordination.
+- Thanks to everyone who reviewed PRs, tested provider/proxy flows, reported edge cases, and helped keep this release window moving.
+
+## [5.8.3] - 2026-06-17
+
+### Changed
+
+- **Database / WebDAV**: Raise the supported SQLite schema to v11 so CLI installs can open and sync databases created by the newer CC Switch line. Fixes [#281](https://github.com/SaladDay/cc-switch-cli/issues/281).
+- **Database / Backups**: Tighten file permissions for the cc-switch database and backup files, including migration and recovery paths.
+- **Release Notes**: Keep the generated release body focused on assets and update metadata while GitHub renders the contributor list.
+
+### Fixed
+
+- **Database / Migration**: Add the v10 -> v11 migration for `proxy_request_logs.pricing_model` and the expanded `usage_daily_rollups` key with `request_model` and `pricing_model`.
+- **WebDAV / Import**: Accept current-schema v11 sync exports instead of treating them as future databases, while still rejecting schemas newer than this build before restore work starts.
+- **Usage Logs**: Preserve the request model and pricing model dimensions when usage rows are rolled up or restored from sync snapshots.
+
+### Commits (since v5.8.2)
+
+- f620fd3b Secure cc-switch database and backup file permissions (#221)
+- 663174ff chore(release): simplify release notes body
+
+### Thanks
+
+- Thanks `@Lei-fly` for opening [#281](https://github.com/SaladDay/cc-switch-cli/issues/281) and spelling out the v5.8.2 to schema v11 compatibility failure.
+- Thanks `@FeiYehua` for the database permission hardening and the schema v11 compatibility work in [#221](https://github.com/SaladDay/cc-switch-cli/pull/221).
+- Thanks `@SaladDay` for the release workflow cleanup and release coordination.
+- Thanks to every contributor who has worked on CC Switch CLI, reported issues, reviewed changes, tested releases, or helped users diagnose upgrade problems.
+
 ## [5.8.2] - 2026-06-11
 
 ### Added

@@ -38,6 +38,7 @@ pub struct SessionSyncResult {
 }
 
 /// 数据来源分布
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataSourceSummary {
@@ -107,33 +108,55 @@ fn merge_sync_step(
 }
 
 pub(crate) fn run_session_usage_sync_cycle_best_effort(db: &Database, context: &str) {
+    match run_session_usage_sync_cycle(db, context) {
+        Ok(_) => {}
+        Err(error) => log::warn!("Session usage sync failed ({context}): {error}"),
+    }
+}
+
+pub(crate) fn run_session_usage_sync_cycle(
+    db: &Database,
+    context: &str,
+) -> Result<SessionSyncResult, AppError> {
+    let mut result = SessionSyncResult {
+        imported: 0,
+        skipped: 0,
+        files_scanned: 0,
+        errors: vec![],
+    };
+
     match db.backfill_missing_usage_costs() {
         Ok(updated) if updated > 0 => {
             log::info!("Usage cost backfill completed ({context}): updated={updated}");
         }
         Ok(_) => log::debug!("No missing usage costs to backfill ({context})"),
-        Err(error) => log::warn!("Usage cost backfill failed ({context}): {error}"),
+        Err(error) => {
+            let message = format!("Usage cost backfill failed: {error}");
+            log::warn!("{message} ({context})");
+            result.errors.push(message);
+        }
     }
 
-    sync_all_session_usage_best_effort(db, context);
+    let sync_result = sync_all_session_usage(db)?;
+    result.merge(sync_result);
+    log_session_usage_sync_result(&result, context);
+    Ok(result)
 }
 
-pub(crate) fn sync_all_session_usage_best_effort(db: &Database, context: &str) {
-    match sync_all_session_usage(db) {
-        Ok(result) if result.imported > 0 || !result.errors.is_empty() => {
-            log::info!(
-                "Session usage sync completed ({context}): imported={}, skipped={}, files={}, errors={}",
-                result.imported,
-                result.skipped,
-                result.files_scanned,
-                result.errors.len()
-            );
-            for error in result.errors.iter().take(3) {
-                log::warn!("Session usage sync error ({context}): {error}");
-            }
+fn log_session_usage_sync_result(result: &SessionSyncResult, context: &str) {
+    if result.imported > 0 || !result.errors.is_empty() {
+        log::info!(
+            "Session usage sync completed ({context}): imported={}, skipped={}, files={}, errors={}",
+            result.imported,
+            result.skipped,
+            result.files_scanned,
+            result.errors.len()
+        );
+        for error in result.errors.iter().take(3) {
+            log::warn!("Session usage sync error ({context}): {error}");
         }
-        Ok(_) => log::debug!("No new session usage logs to sync ({context})"),
-        Err(error) => log::warn!("Session usage sync failed ({context}): {error}"),
+    } else {
+        log::debug!("No new session usage logs to sync ({context})");
     }
 }
 
@@ -199,10 +222,13 @@ pub fn sync_claude_session_logs(db: &Database) -> Result<SessionSyncResult, AppE
     // 收集所有 .jsonl 文件
     let jsonl_files = collect_jsonl_files(&projects_dir);
 
+    // 一次性读取全部同步状态，避免对每个文件单独查询数据库。
+    let sync_states = get_all_sync_states(db)?;
+
     for file_path in &jsonl_files {
         result.files_scanned += 1;
 
-        match sync_single_file(db, file_path) {
+        match sync_single_file(db, file_path, &sync_states) {
             Ok((imported, skipped)) => {
                 result.imported += imported;
                 result.skipped += skipped;
@@ -275,7 +301,11 @@ fn collect_jsonl_files(projects_dir: &Path) -> Vec<PathBuf> {
 }
 
 /// 同步单个 JSONL 文件，返回 (imported, skipped)
-fn sync_single_file(db: &Database, file_path: &Path) -> Result<(u32, u32), AppError> {
+fn sync_single_file(
+    db: &Database,
+    file_path: &Path,
+    sync_states: &HashMap<String, (i64, i64)>,
+) -> Result<(u32, u32), AppError> {
     let file_path_str = file_path.to_string_lossy().to_string();
 
     // 获取文件元数据
@@ -283,8 +313,8 @@ fn sync_single_file(db: &Database, file_path: &Path) -> Result<(u32, u32), AppEr
         .map_err(|e| AppError::Config(format!("无法读取文件元数据: {e}")))?;
     let file_modified = metadata_modified_nanos(&metadata);
 
-    // 检查同步状态
-    let (last_modified, last_offset) = get_sync_state(db, &file_path_str)?;
+    // 检查同步状态（从预加载的快照读取，避免每个文件一次 DB 查询）
+    let (last_modified, last_offset) = sync_states.get(&file_path_str).copied().unwrap_or((0, 0));
 
     // 文件未变化则跳过
     if file_modified <= last_modified {
@@ -455,6 +485,49 @@ pub(crate) fn get_sync_state(db: &Database, file_path: &str) -> Result<(i64, i64
     Ok(result.unwrap_or((0, 0)))
 }
 
+/// Load the entire `session_log_sync` table in one query as
+/// `file_path -> (last_modified, last_line_offset)`. Lets a provider with tens
+/// of thousands of session files check sync state from memory instead of
+/// issuing one `get_sync_state` query per file.
+pub(crate) fn get_all_sync_states(db: &Database) -> Result<HashMap<String, (i64, i64)>, AppError> {
+    let conn = lock_conn!(db.conn);
+    let mut states = HashMap::new();
+    // Tolerate read errors the same way the old per-file `get_sync_state` did
+    // (it returned (0,0) on failure): a missing/unreadable entry just means that
+    // file is treated as never-synced and re-parsed, rather than failing the
+    // whole sync.
+    let mut stmt = match conn
+        .prepare("SELECT file_path, last_modified, last_line_offset FROM session_log_sync")
+    {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            log::warn!("[SESSION-SYNC] 读取同步状态失败，将按未同步重扫: {e}");
+            return Ok(states);
+        }
+    };
+    let rows = match stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?),
+        ))
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            log::warn!("[SESSION-SYNC] 读取同步状态失败，将按未同步重扫: {e}");
+            return Ok(states);
+        }
+    };
+    for row in rows {
+        match row {
+            Ok((file_path, state)) => {
+                states.insert(file_path, state);
+            }
+            Err(e) => log::warn!("[SESSION-SYNC] 跳过损坏的同步状态行: {e}"),
+        }
+    }
+    Ok(states)
+}
+
 /// 返回文件 mtime 的纳秒时间戳。
 ///
 /// `session_log_sync.last_modified` 旧数据是秒级时间戳；新写入纳秒值不需要
@@ -616,6 +689,7 @@ fn find_model_pricing_for_session(
 }
 
 /// 查询数据来源分布统计
+#[allow(dead_code)]
 pub fn get_data_source_breakdown(db: &Database) -> Result<Vec<DataSourceSummary>, AppError> {
     let conn = lock_conn!(db.conn);
 

@@ -1255,14 +1255,44 @@ fn settings_proxy_route_hides_edit_key_when_proxy_is_running() {
 
     let mut data = minimal_data(&app.app_type);
     data.proxy.running = true;
+    data.proxy.active_worker_apps =
+        std::collections::HashSet::from([AppType::Claude.as_str().to_string()]);
     data.proxy.configured_listen_address = "127.0.0.1".to_string();
     data.proxy.configured_listen_port = 15722;
 
     let buf = render(&app, &data);
     let all = all_text(&buf);
 
-    assert!(!all.contains("Enter Edit"));
-    assert!(all.contains("Stop the local proxy before editing listen address or port"));
+    assert!(!all.contains("Enter edit"));
+    assert!(all.contains("Listen address: stop the proxy to edit"));
+    assert!(all.contains("Listen port: stop this app's route to edit"));
+}
+
+#[test]
+fn settings_proxy_shows_edit_key_when_running_but_app_not_routed() {
+    let _lock = lock_env();
+    let _no_color = EnvGuard::remove("NO_COLOR");
+
+    let mut app = App::new(Some(AppType::Claude));
+    app.route = Route::SettingsProxy;
+    app.focus = Focus::Content;
+    app.settings_proxy_idx = app::LocalProxySettingsItem::ALL
+        .iter()
+        .position(|item| matches!(item, app::LocalProxySettingsItem::ListenPort))
+        .expect("ListenPort missing");
+
+    let mut data = minimal_data(&app.app_type);
+    data.proxy.running = true;
+    data.proxy.claude_takeover = false;
+    data.proxy.configured_listen_address = "127.0.0.1".to_string();
+    data.proxy.configured_listen_port = 15722;
+
+    let buf = render(&app, &data);
+    let all = all_text(&buf);
+
+    assert!(all.contains("Enter edit"));
+    assert!(all.contains("Listen port can be edited"));
+    assert!(!all.contains("Listen port: stop this app's route to edit"));
 }
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -1375,16 +1405,12 @@ fn cell_column_of(buf: &Buffer, y: u16, needle: &str) -> Option<u16> {
         return Some(0);
     }
 
-    for x in 0..buf.area.width {
-        if cells.iter().enumerate().all(|(offset, symbol)| {
+    (0..buf.area.width).find(|&x| {
+        cells.iter().enumerate().all(|(offset, symbol)| {
             let cell_x = x.saturating_add(offset as u16);
             cell_x < buf.area.width && buf[(cell_x, y)].symbol() == symbol
-        }) {
-            return Some(x);
-        }
-    }
-
-    None
+        })
+    })
 }
 
 fn all_text(buf: &Buffer) -> String {
@@ -1553,6 +1579,7 @@ pub(super) fn minimal_data(_app_type: &AppType) -> UiData {
                 primary_model_id: Some("claude-sonnet-4".to_string()),
                 default_model_id: None,
             }],
+            loading: false,
         },
         mcp: McpSnapshot::default(),
         prompts: PromptsSnapshot::default(),
@@ -4174,7 +4201,7 @@ fn mcp_page_shows_summary_bar() {
 }
 
 #[test]
-fn skills_discover_page_shows_hint_when_empty() {
+fn skills_discover_page_shows_empty_state() {
     let _lock = lock_env();
     let _no_color = EnvGuard::remove("NO_COLOR");
 
@@ -4188,7 +4215,71 @@ fn skills_discover_page_shows_hint_when_empty() {
     let buf = render(&app, &data);
     let all = all_text(&buf);
 
-    assert!(all.contains(texts::tui_skills_discover_hint()));
+    assert!(all.contains(texts::tui_skills_discover_empty()));
+    assert!(!all.contains(texts::tui_skills_discover_hint()));
+}
+
+#[test]
+fn skills_discover_page_shows_inline_loading() {
+    let _lock = lock_env();
+    let _no_color = EnvGuard::remove("NO_COLOR");
+
+    let mut app = App::new(Some(AppType::Claude));
+    app.route = Route::SkillsDiscover;
+    app.focus = Focus::Content;
+    app.skills_discover_loading = true;
+
+    let data = minimal_data(&app.app_type);
+    let buf = render(&app, &data);
+    let all = all_text(&buf);
+
+    assert!(all.contains(texts::tui_loading()), "{all}");
+}
+
+#[test]
+fn skills_discover_marketplace_prompts_for_search() {
+    let _lock = lock_env();
+    let _no_color = EnvGuard::remove("NO_COLOR");
+
+    let mut app = App::new(Some(AppType::Claude));
+    app.route = Route::SkillsDiscover;
+    app.focus = Focus::Content;
+    app.skills_discover_source = crate::cli::tui::app::SkillsDiscoverSource::Marketplace;
+
+    let data = minimal_data(&app.app_type);
+    let buf = render(&app, &data);
+    let all = all_text(&buf);
+
+    assert!(
+        all.contains(texts::tui_skills_skillssh_search_prompt()),
+        "{all}"
+    );
+}
+
+#[test]
+fn skills_discover_page_renders_source_tabs() {
+    let _lock = lock_env();
+    let _no_color = EnvGuard::remove("NO_COLOR");
+
+    let mut app = App::new(Some(AppType::Claude));
+    app.route = Route::SkillsDiscover;
+    app.focus = Focus::Content;
+
+    let data = minimal_data(&app.app_type);
+    let buf = render(&app, &data);
+    let all = all_text(&buf);
+
+    assert!(all.contains(texts::tui_skills_source_repos()), "{all}");
+    assert!(
+        all.contains(texts::tui_skills_source_marketplace()),
+        "{all}"
+    );
+    assert!(
+        all.contains(texts::tui_skills_source_switch_hint()),
+        "{all}"
+    );
+    assert!(all.contains(texts::tui_key_refresh()), "{all}");
+    assert!(all.contains(texts::tui_key_repo_manager()), "{all}");
 }
 
 #[test]

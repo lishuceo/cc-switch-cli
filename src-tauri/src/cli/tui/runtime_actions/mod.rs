@@ -141,6 +141,10 @@ pub(super) struct RuntimeActionContext<'a> {
     managed_auth_req_tx: Option<&'a mpsc::Sender<ManagedAuthReq>>,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "TUI dispatcher receives independent worker channels and request trackers"
+)]
 pub(crate) fn handle_action(
     terminal: &mut TuiTerminal,
     app: &mut App,
@@ -330,6 +334,18 @@ pub(crate) fn handle_action(
         Action::SwitchRoute(route) => {
             ctx.app.route = route;
             ctx.app.maybe_prompt_import_candidate(ctx.data);
+            if matches!(ctx.app.route, super::route::Route::SkillsDiscover)
+                && ctx.app.skills_discover_results.is_empty()
+                && !ctx.app.skills_discover_loading
+                && matches!(
+                    ctx.app.skills_discover_source,
+                    super::app::SkillsDiscoverSource::Repos
+                )
+            {
+                let query = ctx.app.skills_discover_query.clone();
+                let source = ctx.app.skills_discover_source;
+                skills::discover(&mut ctx, query, source, false)?;
+            }
             Ok(())
         }
         Action::Quit => {
@@ -342,7 +358,11 @@ pub(crate) fn handle_action(
         Action::SkillsUninstall { directory } => skills::uninstall(&mut ctx, directory),
         Action::SkillsSync { app: scope } => skills::sync(&mut ctx, scope),
         Action::SkillsSetSyncMethod { method } => skills::set_sync_method(&mut ctx, method),
-        Action::SkillsDiscover { query } => skills::discover(&mut ctx, query),
+        Action::SkillsDiscover {
+            query,
+            source,
+            force,
+        } => skills::discover(&mut ctx, query, source, force),
         Action::SkillsRepoAdd { spec } => skills::repo_add(&mut ctx, spec),
         Action::SkillsRepoRemove { owner, name } => skills::repo_remove(&mut ctx, owner, name),
         Action::SkillsRepoToggleEnabled {
@@ -496,6 +516,9 @@ pub(crate) fn handle_action(
                 ToastKind::Success,
             );
             Ok(())
+        }
+        Action::SetCodexUnifiedSessionHistory { enabled } => {
+            settings::set_codex_unified_session_history(&mut ctx, enabled)
         }
         Action::SetProxyEnabled { enabled } => settings::set_proxy_enabled(&mut ctx, enabled),
         Action::SetProxyListenAddress { address } => {

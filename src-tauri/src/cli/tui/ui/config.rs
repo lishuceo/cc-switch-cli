@@ -515,7 +515,7 @@ fn render_openclaw_env_section_block(
         }))
         .split(inner);
 
-    for (row, chunk) in rows.iter().zip(chunks.into_iter()) {
+    for (row, chunk) in rows.iter().zip(chunks.iter()) {
         frame.render_widget(
             Paragraph::new(row.line.clone()).wrap(Wrap { trim: false }),
             *chunk,
@@ -529,6 +529,10 @@ fn append_json_lines(lines: &mut Vec<String>, value: &Value) {
     lines.extend(pretty.lines().map(|line| format!("  {line}")));
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "OpenClaw route renderer receives UI context plus parsed config metadata"
+)]
 fn render_openclaw_env_route(
     frame: &mut Frame<'_>,
     app: &App,
@@ -854,7 +858,7 @@ fn render_openclaw_tools_section_block(
         }))
         .split(inner);
 
-    for (row, chunk) in rows.iter().zip(chunks.into_iter()) {
+    for (row, chunk) in rows.iter().zip(chunks.iter()) {
         let paragraph = if row.wrap {
             Paragraph::new(row.line.clone()).wrap(Wrap { trim: false })
         } else {
@@ -864,6 +868,10 @@ fn render_openclaw_tools_section_block(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "OpenClaw route renderer receives UI context plus parsed config metadata"
+)]
 fn render_openclaw_tools_route(
     frame: &mut Frame<'_>,
     app: &App,
@@ -1354,7 +1362,7 @@ fn render_openclaw_agents_section_block(
         }))
         .split(inner);
 
-    for (row, chunk) in rows.iter().zip(chunks.into_iter()) {
+    for (row, chunk) in rows.iter().zip(chunks.iter()) {
         let paragraph = if row.wrap {
             Paragraph::new(row.line.clone()).wrap(Wrap { trim: false })
         } else {
@@ -1364,6 +1372,10 @@ fn render_openclaw_agents_section_block(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "OpenClaw route renderer receives UI context plus parsed config metadata"
+)]
 fn render_openclaw_agents_route(
     frame: &mut Frame<'_>,
     app: &App,
@@ -2509,6 +2521,7 @@ pub(super) fn render_settings(
     let openclaw_config_dir = crate::settings::get_settings().openclaw_config_dir;
     let skip_claude_onboarding = crate::settings::get_skip_claude_onboarding();
     let claude_plugin_integration = crate::settings::get_enable_claude_plugin_integration();
+    let codex_unified_session_history = crate::settings::unify_codex_session_history();
 
     let rows_data = super::app::SettingsItem::ALL
         .iter()
@@ -2553,6 +2566,14 @@ pub(super) fn render_settings(
             super::app::SettingsItem::ClaudePluginIntegration => (
                 texts::enable_claude_plugin_integration_label().to_string(),
                 if claude_plugin_integration {
+                    texts::enabled().to_string()
+                } else {
+                    texts::disabled().to_string()
+                },
+            ),
+            super::app::SettingsItem::CodexUnifiedSessionHistory => (
+                texts::codex_unified_session_history_label().to_string(),
+                if codex_unified_session_history {
                     texts::enabled().to_string()
                 } else {
                     texts::disabled().to_string()
@@ -3163,7 +3184,12 @@ pub(super) fn render_settings_proxy(
     if app.focus == Focus::Content {
         let key_label = match LocalProxySettingsItem::ALL.get(app.settings_proxy_idx) {
             Some(LocalProxySettingsItem::AutoFailover) => texts::tui_key_toggle(),
-            _ if data.proxy.running => "",
+            Some(LocalProxySettingsItem::ListenAddress) if data.proxy.running => "",
+            Some(LocalProxySettingsItem::ListenPort)
+                if data.proxy.has_active_worker_for(&app.app_type) =>
+            {
+                ""
+            }
             _ => texts::tui_key_edit(),
         };
         if !key_label.is_empty() {
@@ -3184,14 +3210,16 @@ pub(super) fn render_settings_proxy(
     state.select(Some(app.settings_proxy_idx));
     frame.render_stateful_widget(table, inset_left(chunks[1], CONTENT_INSET_LEFT), &mut state);
 
+    let hint = if !data.proxy.running {
+        texts::tui_settings_proxy_restart_hint()
+    } else {
+        let current_app_has_active_worker = data.proxy.has_active_worker_for(&app.app_type);
+        texts::tui_settings_proxy_stop_before_edit_hint(current_app_has_active_worker)
+    };
     frame.render_widget(
-        Paragraph::new(if data.proxy.running {
-            texts::tui_settings_proxy_stop_before_edit_hint()
-        } else {
-            texts::tui_settings_proxy_restart_hint()
-        })
-        .alignment(Alignment::Center)
-        .style(Style::default().fg(theme.dim)),
+        Paragraph::new(hint)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(theme.dim)),
         chunks[2],
     );
 }

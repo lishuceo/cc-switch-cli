@@ -86,6 +86,11 @@ impl App {
             skills_unmanaged_idx: 0,
             skills_discover_results: Vec::new(),
             skills_discover_query: String::new(),
+            skills_discover_source: SkillsDiscoverSource::Repos,
+            skills_discover_loading: false,
+            skills_discover_request_id: 0,
+            skills_discover_active_request_id: None,
+            skills_discover_cache: HashMap::new(),
             skills_unmanaged_results: Vec::new(),
             skills_unmanaged_selected: HashSet::new(),
             config_idx: 0,
@@ -318,7 +323,8 @@ impl App {
     }
 
     pub(crate) fn should_poll_proxy_activity(&self) -> bool {
-        matches!(self.route, Route::Main) && self.tick % PROXY_ACTIVITY_POLL_INTERVAL_TICKS == 0
+        matches!(self.route, Route::Main)
+            && self.tick.is_multiple_of(PROXY_ACTIVITY_POLL_INTERVAL_TICKS)
     }
 
     pub(crate) fn reset_proxy_activity(&mut self, input_tokens: u64, output_tokens: u64) {
@@ -583,12 +589,12 @@ impl App {
                 self.prepare_filter_focus();
                 return Action::None;
             }
-            KeyCode::Char('[') => {
+            KeyCode::Char('[') | KeyCode::Char('【') | KeyCode::Char('［') => {
                 return cycle_app_type(&self.app_type, -1)
                     .map(Action::SetAppType)
                     .unwrap_or(Action::None);
             }
-            KeyCode::Char(']') => {
+            KeyCode::Char(']') | KeyCode::Char('】') | KeyCode::Char('］') => {
                 return cycle_app_type(&self.app_type, 1)
                     .map(Action::SetAppType)
                     .unwrap_or(Action::None);

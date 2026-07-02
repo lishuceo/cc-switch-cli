@@ -1,6 +1,10 @@
 use super::*;
 
 #[cfg(test)]
+#[expect(
+    clippy::module_inception,
+    reason = "test module mirrors the file layout"
+)]
 mod tests {
     use super::types::{McpEnvEditorField, McpEnvEntryEditorState};
     use super::*;
@@ -37,8 +41,10 @@ mod tests {
     impl SettingsGuard {
         fn with_openclaw_dir(path: &Path) -> Self {
             let previous = get_settings();
-            let mut settings = AppSettings::default();
-            settings.openclaw_config_dir = Some(path.display().to_string());
+            let settings = AppSettings {
+                openclaw_config_dir: Some(path.display().to_string()),
+                ..Default::default()
+            };
             update_settings(settings).expect("set openclaw override dir");
             Self { previous }
         }
@@ -559,6 +565,53 @@ mod tests {
     }
 
     #[test]
+    fn skills_discover_tab_toggles_marketplace_source() {
+        let mut app = App::new(Some(AppType::Claude));
+        app.route = Route::SkillsDiscover;
+        app.focus = Focus::Content;
+        app.skills_discover_query = "python".to_string();
+
+        let action = app.on_key(key(KeyCode::Tab), &data());
+
+        assert_eq!(
+            app.skills_discover_source,
+            SkillsDiscoverSource::Marketplace
+        );
+        assert!(matches!(action, Action::None));
+    }
+
+    #[test]
+    fn skills_discover_r_refreshes_current_source() {
+        let mut app = App::new(Some(AppType::Claude));
+        app.route = Route::SkillsDiscover;
+        app.focus = Focus::Content;
+        app.skills_discover_query = "python".to_string();
+        app.skills_discover_source = SkillsDiscoverSource::Marketplace;
+
+        let action = app.on_key(key(KeyCode::Char('r')), &data());
+
+        assert!(matches!(
+            action,
+            Action::SkillsDiscover {
+                query,
+                source: SkillsDiscoverSource::Marketplace,
+                force: true,
+            } if query == "python"
+        ));
+    }
+
+    #[test]
+    fn skills_discover_e_opens_repo_manager() {
+        let mut app = App::new(Some(AppType::Claude));
+        app.route = Route::SkillsDiscover;
+        app.focus = Focus::Content;
+
+        let action = app.on_key(key(KeyCode::Char('e')), &data());
+
+        assert!(matches!(action, Action::SwitchRoute(Route::SkillsRepos)));
+    }
+
+    #[test]
     fn skills_m_opens_apps_picker_overlay() {
         let mut app = App::new(Some(AppType::Codex));
         app.route = Route::Skills;
@@ -911,7 +964,7 @@ mod tests {
         assert!(imports[0].apps.claude);
         assert!(imports[0].apps.opencode);
         assert!(
-            imports[0].apps.is_empty() == false,
+            !imports[0].apps.is_empty(),
             "supported app targets should be preserved"
         );
         assert!(
@@ -965,6 +1018,39 @@ mod tests {
         ));
         assert!(matches!(
             app.on_key(key(KeyCode::Char('[')), &data()),
+            Action::SetAppType(AppType::OpenClaw)
+        ));
+    }
+
+    #[test]
+    #[serial(home_settings)]
+    fn app_cycles_with_chinese_brackets() {
+        let temp_home = TempDir::new().expect("create temp home");
+        let _env = TestEnvGuard::isolated(temp_home.path());
+        crate::settings::set_visible_apps(crate::settings::VisibleApps {
+            claude: true,
+            codex: true,
+            gemini: true,
+            opencode: true,
+            hermes: false,
+            openclaw: true,
+        })
+        .expect("save visible apps");
+        let mut app = App::new(Some(AppType::Claude));
+        assert!(matches!(
+            app.on_key(key(KeyCode::Char('】')), &data()),
+            Action::SetAppType(AppType::Codex)
+        ));
+        assert!(matches!(
+            app.on_key(key(KeyCode::Char('【')), &data()),
+            Action::SetAppType(AppType::OpenClaw)
+        ));
+        assert!(matches!(
+            app.on_key(key(KeyCode::Char('］')), &data()),
+            Action::SetAppType(AppType::Codex)
+        ));
+        assert!(matches!(
+            app.on_key(key(KeyCode::Char('［')), &data()),
             Action::SetAppType(AppType::OpenClaw)
         ));
     }
@@ -1271,9 +1357,9 @@ mod tests {
     #[test]
     fn filter_mode_updates_buffer_and_exits() {
         let mut app = App::new(Some(AppType::Claude));
-        assert_eq!(app.filter.active, false);
+        assert!(!app.filter.active);
         app.on_key(key(KeyCode::Char('/')), &data());
-        assert_eq!(app.filter.active, true);
+        assert!(app.filter.active);
         app.on_key(key(KeyCode::Char('a')), &data());
         app.on_key(key(KeyCode::Char('b')), &data());
         app.on_key(key(KeyCode::Char('j')), &data());
@@ -1282,7 +1368,7 @@ mod tests {
         app.on_key(key(KeyCode::Backspace), &data());
         assert_eq!(app.filter.input.value, "abj");
         app.on_key(key(KeyCode::Enter), &data());
-        assert_eq!(app.filter.active, false);
+        assert!(!app.filter.active);
     }
 
     #[test]
@@ -9344,6 +9430,16 @@ mod tests {
     }
 
     #[test]
+    fn settings_menu_exposes_codex_unified_session_history_item() {
+        assert!(
+            SettingsItem::ALL
+                .iter()
+                .any(|item| matches!(item, SettingsItem::CodexUnifiedSessionHistory)),
+            "Settings should expose unified Codex session history"
+        );
+    }
+
+    #[test]
     fn settings_managed_accounts_item_opens_page_and_refreshes_when_status_missing() {
         let mut app = App::new(Some(AppType::Claude));
         app.route = Route::Settings;
@@ -9556,6 +9652,31 @@ mod tests {
         assert!(matches!(
             action,
             Action::SetOpenClawConfigDir { path: None }
+        ));
+    }
+
+    #[test]
+    #[serial(home_settings)]
+    fn settings_codex_unified_session_history_item_opens_confirm_overlay() {
+        let temp_home = TempDir::new().expect("create temp home");
+        let _env = TestEnvGuard::isolated(temp_home.path());
+
+        let mut app = App::new(Some(AppType::Codex));
+        app.route = Route::Settings;
+        app.focus = Focus::Content;
+        app.settings_idx = SettingsItem::ALL
+            .iter()
+            .position(|item| matches!(item, SettingsItem::CodexUnifiedSessionHistory))
+            .expect("CodexUnifiedSessionHistory missing from SettingsItem::ALL");
+
+        let action = app.on_key(key(KeyCode::Enter), &UiData::default());
+        assert!(matches!(action, Action::None));
+        assert!(matches!(
+            &app.overlay,
+            Overlay::Confirm(ConfirmOverlay {
+                action: ConfirmAction::SettingsSetCodexUnifiedSessionHistory { enabled: true },
+                ..
+            })
         ));
     }
 
@@ -9868,6 +9989,7 @@ mod tests {
 
         let mut data = UiData::default();
         data.proxy.running = true;
+        data.proxy.claude_takeover = true;
         data.proxy.configured_listen_address = "127.0.0.1".to_string();
         data.proxy.configured_listen_port = 15721;
 
@@ -9880,7 +10002,106 @@ mod tests {
                 message,
                 kind: ToastKind::Info,
                 ..
-            }) if message == "The local proxy is running. Stop it before editing listen address or port."
+            }) if message == "The local proxy is running. Stop it before editing listen address."
+        ));
+    }
+
+    #[test]
+    fn settings_proxy_port_editable_when_proxy_running_but_app_not_routed() {
+        let mut app = App::new(Some(AppType::Claude));
+        app.route = Route::SettingsProxy;
+        app.focus = Focus::Content;
+        app.settings_proxy_idx = LocalProxySettingsItem::ALL
+            .iter()
+            .position(|item| matches!(item, LocalProxySettingsItem::ListenPort))
+            .expect("ListenPort missing");
+
+        let mut data = UiData::default();
+        data.proxy.running = true;
+        data.proxy.claude_takeover = false;
+        data.proxy.configured_listen_port = 15721;
+
+        let action = app.on_key(key(KeyCode::Enter), &data);
+        assert!(matches!(action, Action::None));
+        assert!(matches!(
+            app.overlay,
+            Overlay::TextInput(TextInputState {
+                submit: TextSubmit::SettingsProxyListenPort,
+                ..
+            })
+        ));
+
+        app.overlay = Overlay::TextInput(TextInputState {
+            title: "Listen Port".to_string(),
+            prompt: "port".to_string(),
+            input: TextInput::new("15721".to_string()),
+            submit: TextSubmit::SettingsProxyListenPort,
+            secret: false,
+        });
+        let action = app.on_key(key(KeyCode::Enter), &data);
+        assert!(matches!(
+            action,
+            Action::SetProxyListenPort { port } if port == 15721
+        ));
+    }
+
+    #[test]
+    fn settings_proxy_port_blocked_when_active_worker_exists() {
+        let mut app = App::new(Some(AppType::Claude));
+        app.route = Route::SettingsProxy;
+        app.focus = Focus::Content;
+        app.settings_proxy_idx = LocalProxySettingsItem::ALL
+            .iter()
+            .position(|item| matches!(item, LocalProxySettingsItem::ListenPort))
+            .expect("ListenPort missing");
+
+        let mut data = UiData::default();
+        data.proxy.running = true;
+        data.proxy.active_worker_apps =
+            std::collections::HashSet::from([AppType::Claude.as_str().to_string()]);
+        data.proxy.configured_listen_port = 15721;
+
+        let action = app.on_key(key(KeyCode::Enter), &data);
+        assert!(matches!(action, Action::None));
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(matches!(
+            app.toast.as_ref(),
+            Some(Toast {
+                message,
+                kind: ToastKind::Info,
+                ..
+            }) if message == "This app is using the proxy. Stop this app's proxy route before editing listen port."
+        ));
+    }
+
+    #[test]
+    fn settings_proxy_port_submit_blocked_when_active_worker_starts_before_confirm() {
+        let mut app = App::new(Some(AppType::Claude));
+        app.route = Route::SettingsProxy;
+        app.focus = Focus::Content;
+        app.overlay = Overlay::TextInput(TextInputState {
+            title: "Listen Port".to_string(),
+            prompt: "port".to_string(),
+            input: TextInput::new("15721".to_string()),
+            submit: TextSubmit::SettingsProxyListenPort,
+            secret: false,
+        });
+
+        let mut data = UiData::default();
+        data.proxy.running = true;
+        data.proxy.active_worker_apps =
+            std::collections::HashSet::from([AppType::Claude.as_str().to_string()]);
+
+        let action = app.on_key(key(KeyCode::Enter), &data);
+        assert!(matches!(action, Action::None));
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(matches!(
+            app.toast.as_ref(),
+            Some(Toast {
+                message,
+                kind: ToastKind::Info,
+                ..
+            }) if message == "This app is using the proxy. Stop this app's proxy route before editing listen port."
         ));
     }
 
@@ -9975,6 +10196,7 @@ mod tests {
 
         let mut data = UiData::default();
         data.proxy.running = true;
+        data.proxy.claude_takeover = true;
 
         let action = app.on_key(key(KeyCode::Enter), &data);
         assert!(matches!(action, Action::None));
@@ -9985,7 +10207,7 @@ mod tests {
                 message,
                 kind: ToastKind::Info,
                 ..
-            }) if message == "The local proxy is running. Stop it before editing listen address or port."
+            }) if message == "The local proxy is running. Stop it before editing listen address."
         ));
     }
 
@@ -10557,7 +10779,8 @@ mod tests {
     #[test]
     #[serial]
     fn prompt_save_runtime_creates_prompt_from_one_page_form() {
-        let _guard = TestEnvGuard::isolated(tempfile::tempdir().expect("tempdir").path());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = TestEnvGuard::isolated(temp.path());
         let state = crate::AppState::try_new().expect("load state");
         state.save().expect("persist empty state");
 
@@ -10646,7 +10869,8 @@ mod tests {
     #[test]
     #[serial]
     fn prompt_create_runtime_clears_filter_when_new_prompt_is_not_visible() {
-        let _guard = TestEnvGuard::isolated(tempfile::tempdir().expect("tempdir").path());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = TestEnvGuard::isolated(temp.path());
         let state = crate::AppState::try_new().expect("load state");
         state.save().expect("persist empty state");
 
@@ -14160,6 +14384,112 @@ mod tests {
         app.sessions.provider_id = Some("claude".to_string());
         app.sessions.rows.push(session_meta_for_app("claude"));
         app
+    }
+
+    #[test]
+    fn sessions_page_keys_move_selection_by_page_and_clamp() {
+        let mut app = App::new(Some(AppType::Claude));
+        app.route = Route::Sessions;
+        app.focus = Focus::Content;
+        app.sessions.pane = SessionsPane::List;
+        app.sessions.loaded_once = true;
+        app.sessions.provider_id = Some("claude".to_string());
+        app.last_size = Size {
+            width: 120,
+            height: 40,
+        };
+        for i in 0..200 {
+            app.sessions.rows.push(session_meta(
+                "claude",
+                &format!("s{i}"),
+                "Title",
+                "/tmp/p",
+                "/tmp/s.jsonl",
+                "claude --resume",
+            ));
+        }
+        // page size = last_size.height(40) - chrome(9)
+        let page = 40usize - 9;
+
+        app.on_sessions_key(key(KeyCode::PageDown), &data());
+        assert_eq!(app.sessions.selected_idx, page);
+
+        app.on_sessions_key(key(KeyCode::End), &data());
+        assert_eq!(app.sessions.selected_idx, 199);
+
+        // PageDown at the bottom is clamped to the last row.
+        app.on_sessions_key(key(KeyCode::PageDown), &data());
+        assert_eq!(app.sessions.selected_idx, 199);
+
+        app.on_sessions_key(key(KeyCode::PageUp), &data());
+        assert_eq!(app.sessions.selected_idx, 199 - page);
+
+        app.on_sessions_key(key(KeyCode::Home), &data());
+        assert_eq!(app.sessions.selected_idx, 0);
+
+        // PageUp at the top stays at 0.
+        app.on_sessions_key(key(KeyCode::PageUp), &data());
+        assert_eq!(app.sessions.selected_idx, 0);
+    }
+
+    #[test]
+    fn session_scan_cache_restores_for_the_whole_run() {
+        let mut sessions = SessionsState::default();
+        let req = sessions.start_scan("claude".to_string());
+        assert!(sessions.finish_scan(req, vec![session_meta_for_app("claude")]));
+        assert!(sessions.scan_cache.contains_key("claude"));
+
+        // Switching to another provider clears the live rows...
+        let _ = sessions.start_scan("codex".to_string());
+        assert!(sessions.rows.is_empty());
+
+        // ...switching back hits the cache and restores instantly, no re-scan.
+        assert!(sessions.restore_from_scan_cache("claude"));
+        assert_eq!(sessions.rows.len(), 1);
+        assert!(sessions.loaded_once);
+        assert_eq!(sessions.provider_id.as_deref(), Some("claude"));
+
+        // The cache never expires within a run, so a repeat restore still hits
+        // (only a manual `r` reload re-scans, which goes through start_scan).
+        let _ = sessions.start_scan("codex".to_string());
+        assert!(sessions.restore_from_scan_cache("claude"));
+        assert_eq!(sessions.rows.len(), 1);
+
+        // A provider that was never scanned is a miss.
+        assert!(!sessions.restore_from_scan_cache("gemini"));
+    }
+
+    #[test]
+    fn deleting_session_updates_scan_cache_to_prevent_resurrection() {
+        let mut sessions = SessionsState::default();
+        let req = sessions.start_scan("claude".to_string());
+        let a = session_meta(
+            "claude",
+            "a",
+            "A",
+            "/tmp",
+            "/tmp/a.jsonl",
+            "claude --resume a",
+        );
+        let b = session_meta(
+            "claude",
+            "b",
+            "B",
+            "/tmp",
+            "/tmp/b.jsonl",
+            "claude --resume b",
+        );
+        let key_b = session_key(&b);
+        assert!(sessions.finish_scan(req, vec![a, b]));
+        assert_eq!(sessions.scan_cache.get("claude").unwrap().rows.len(), 2);
+
+        assert!(sessions.remove_session_by_key(&key_b));
+        assert_eq!(sessions.rows.len(), 1);
+        // The cached snapshot drops the deleted session too, so a cache restore
+        // cannot resurrect it.
+        let cached = sessions.scan_cache.get("claude").unwrap();
+        assert_eq!(cached.rows.len(), 1);
+        assert!(cached.rows.iter().all(|s| session_key(s) != key_b));
     }
 
     #[test]

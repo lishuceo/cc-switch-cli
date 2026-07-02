@@ -58,6 +58,8 @@ CI_TUI_OPERATIONS = {
     "open_providers",
     "provider_switch_a_to_b",
 }
+PROVIDER_SWITCH_CONFLICT_INPUT = b"\x1b[B\n" * 32
+TUI_PROVIDER_SWITCH_CONFLICT_INPUT = b"c" * 32
 
 
 class BenchmarkAbort(RuntimeError):
@@ -138,6 +140,9 @@ def read_json(path: Path) -> dict:
 def write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    # cc-switch checks that sensitive files (.json, .db) have 0600 on Unix.
+    if sys.platform != "win32":
+        path.chmod(0o600)
 
 
 @dataclass
@@ -188,7 +193,11 @@ def configure_environment(real_env: bool) -> BenchEnvironment:
     }
     old_env = {key: os.environ.get(key) for key in env_updates}
     for path in env_updates.values():
-        Path(path).mkdir(parents=True, exist_ok=True)
+        p = Path(path)
+        p.mkdir(parents=True, exist_ok=True)
+        # cc-switch checks that its config dir has 0700 permissions on Unix.
+        if path == env_updates["CC_SWITCH_CONFIG_DIR"]:
+            p.chmod(0o700)
     for key, value in env_updates.items():
         os.environ[key] = value
     return BenchEnvironment(mode="sandbox", root=root, old_env=old_env)
@@ -325,6 +334,9 @@ def connect_db(paths: Paths) -> sqlite3.Connection:
     paths.cc_dir.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(paths.db_path)
     conn.execute("PRAGMA busy_timeout = 5000")
+    # cc-switch checks that .db files have 0600 permissions on Unix.
+    if sys.platform != "win32":
+        paths.db_path.chmod(0o600)
     return conn
 
 
@@ -1398,8 +1410,12 @@ def timed_cli(
     args: list[str],
     timeout: float = 60.0,
     fail_fast: bool = False,
+    runner: Callable[[list[str], float, bool], RunResult] | None = None,
 ) -> RunResult:
-    result = run_command([str(binary), *args], timeout=timeout, capture_timeout=fail_fast)
+    if runner is None:
+        result = run_command([str(binary), *args], timeout=timeout, capture_timeout=fail_fast)
+    else:
+        result = runner([str(binary), *args], timeout, fail_fast)
     if result.code == 0:
         metrics.add(surface, app, operation, result.ms)
     else:
@@ -1410,8 +1426,12 @@ def timed_cli(
     return result
 
 
+def run_provider_switch_cli(args: list[str], timeout: float = 60.0, _capture_timeout: bool = False) -> RunResult:
+    return run_pty_command(args, send=PROVIDER_SWITCH_CONFLICT_INPUT, timeout=timeout)
+
+
 def reset_provider_cli(binary: Path, app: str, provider_id: str) -> None:
-    result = run_command([str(binary), "--app", app, "provider", "switch", provider_id], timeout=60)
+    result = run_provider_switch_cli([str(binary), "--app", app, "provider", "switch", provider_id], timeout=60)
     if result.code != 0:
         raise RuntimeError(f"failed to reset {app} to {provider_id}: {result.stderr or result.stdout}")
 
@@ -1467,7 +1487,16 @@ def benchmark_cli(
 
             if cli_enabled("provider_switch_a_to_b"):
                 reset_provider_cli(binary, app, a)
-                switched = timed_cli(prefix_metrics, binary, "CLI", app, "provider_switch_a_to_b", ["--app", app, "provider", "switch", b], fail_fast=fail_fast and record)
+                switched = timed_cli(
+                    prefix_metrics,
+                    binary,
+                    "CLI",
+                    app,
+                    "provider_switch_a_to_b",
+                    ["--app", app, "provider", "switch", b],
+                    fail_fast=fail_fast and record,
+                    runner=run_provider_switch_cli,
+                )
                 if switched.code != 0:
                     reset_provider_cli(binary, app, a)
                     continue
@@ -1813,6 +1842,8 @@ def benchmark_tui(
                 session.clear()
                 start_switch = time.perf_counter()
                 session.send(b" ")
+                time.sleep(0.15)
+                session.send(TUI_PROVIDER_SWITCH_CONFLICT_INPUT)
                 wait_until_tui(session, lambda: effective_current_provider(paths, app) == b, timeout=8)
                 return (time.perf_counter() - start_switch) * 1000
 

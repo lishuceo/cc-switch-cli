@@ -12,18 +12,18 @@ use crate::services::{SkillService, StreamCheckService, WebDavSyncService};
 use crate::settings::{set_webdav_sync_settings, webdav_jianguoyun_preset};
 
 use super::super::data::{
-    load_snapshot_state, load_state, load_usage_pricing_data_from_state_for_range, UiData,
-    UsageRangePreset,
+    load_proxy_snapshot_from_state_async, load_snapshot_state, load_state,
+    load_usage_pricing_data_from_state_for_range, UiData, UsageRangePreset,
 };
 use super::types::{
     fetch_provider_models_for_tui, model_fetch_strategy_for_field, AppDataLoadKind, AppDataMsg,
     AppDataReq, AppDataSystem, LocalEnvMsg, LocalEnvReq, LocalEnvSystem, ManagedAuthMsg,
     ManagedAuthReq, ManagedAuthSystem, ModelFetchMsg, ModelFetchReq, ModelFetchSystem, ProxyMsg,
     ProxyReq, ProxySystem, QuotaMsg, QuotaReq, QuotaSystem, SessionMsg, SessionReq, SessionSystem,
-    SkillsMsg, SkillsReq, SkillsSystem, SpeedtestMsg, SpeedtestSystem, StreamCheckMsg,
-    StreamCheckReq, StreamCheckSystem, UpdateMsg, UpdateReq, UpdateSystem, UsagePricingMsg,
-    UsagePricingReq, UsagePricingSystem, WebDavDone, WebDavErr, WebDavMsg, WebDavReq,
-    WebDavReqKind, WebDavSystem,
+    SessionUsageSyncMsg, SessionUsageSyncReq, SessionUsageSyncSystem, SkillsMsg, SkillsReq,
+    SkillsSystem, SpeedtestMsg, SpeedtestSystem, StreamCheckMsg, StreamCheckReq, StreamCheckSystem,
+    UpdateMsg, UpdateReq, UpdateSystem, UsagePricingMsg, UsagePricingReq, UsagePricingSystem,
+    WebDavDone, WebDavErr, WebDavMsg, WebDavReq, WebDavReqKind, WebDavSystem,
 };
 
 pub(crate) fn start_proxy_system() -> Result<ProxySystem, AppError> {
@@ -67,6 +67,16 @@ fn proxy_worker_loop(rx: mpsc::Receiver<ProxyReq>, tx: mpsc::Sender<ProxyMsg>) {
                             result: Err(err.clone()),
                         });
                     }
+                    ProxyReq::RefreshSnapshot {
+                        request_id,
+                        app_type,
+                    } => {
+                        let _ = tx.send(ProxyMsg::SnapshotRefreshed {
+                            request_id,
+                            app_type,
+                            result: Err(err.clone()),
+                        });
+                    }
                 }
             }
             return;
@@ -92,6 +102,21 @@ fn proxy_worker_loop(rx: mpsc::Receiver<ProxyReq>, tx: mpsc::Sender<ProxyMsg>) {
                     request_id,
                     app_type,
                     enabled,
+                    result,
+                });
+            }
+            ProxyReq::RefreshSnapshot {
+                request_id,
+                app_type,
+            } => {
+                let result = load_state().map_err(|e| e.to_string()).and_then(|state| {
+                    rt.block_on(load_proxy_snapshot_from_state_async(&state, &app_type))
+                        .map_err(|e| e.to_string())
+                });
+
+                let _ = tx.send(ProxyMsg::SnapshotRefreshed {
+                    request_id,
+                    app_type,
                     result,
                 });
             }
@@ -664,7 +689,6 @@ fn handle_session_req(req: SessionReq, tx: &mpsc::Sender<SessionMsg>) -> Result<
                 crate::session_manager::scan_sessions_for_provider(&provider_id)
             })
             .map_err(|_| "session scan panicked".to_string());
-            let result = result;
             tx.send(SessionMsg::ScanFinished { request_id, result })
                 .map_err(|_| ())
         }
@@ -810,6 +834,25 @@ pub(crate) fn start_usage_pricing_system() -> Result<UsagePricingSystem, AppErro
     })
 }
 
+pub(crate) fn start_session_usage_sync_system() -> Result<SessionUsageSyncSystem, AppError> {
+    let (result_tx, result_rx) = mpsc::channel::<SessionUsageSyncMsg>();
+    let (req_tx, req_rx) = mpsc::channel::<SessionUsageSyncReq>();
+
+    let handle = std::thread::Builder::new()
+        .name("cc-switch-session-usage".to_string())
+        .spawn(move || session_usage_sync_worker_loop(req_rx, result_tx))
+        .map_err(|e| AppError::IoContext {
+            context: "failed to spawn session usage sync worker thread".to_string(),
+            source: e,
+        })?;
+
+    Ok(SessionUsageSyncSystem {
+        req_tx,
+        result_rx,
+        _handle: handle,
+    })
+}
+
 pub(crate) fn start_app_data_system() -> Result<AppDataSystem, AppError> {
     let (result_tx, result_rx) = mpsc::channel::<AppDataMsg>();
     let (req_tx, req_rx) = mpsc::channel::<AppDataReq>();
@@ -827,6 +870,39 @@ pub(crate) fn start_app_data_system() -> Result<AppDataSystem, AppError> {
         result_rx,
         _handle: handle,
     })
+}
+
+fn session_usage_sync_worker_loop(
+    rx: mpsc::Receiver<SessionUsageSyncReq>,
+    tx: mpsc::Sender<SessionUsageSyncMsg>,
+) {
+    while let Ok(mut req) = rx.recv() {
+        for next in rx.try_iter() {
+            req = next;
+        }
+
+        let SessionUsageSyncReq::Run { request_id } = req;
+        let result = match crate::Database::init() {
+            Ok(db) => {
+                crate::services::session_usage::run_session_usage_sync_cycle(&db, "tui-background")
+                    .and_then(|result| {
+                        if result.errors.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(AppError::Message(format!(
+                                "{} session usage sync error(s); first: {}",
+                                result.errors.len(),
+                                result.errors[0]
+                            )))
+                        }
+                    })
+                    .map_err(|error| error.to_string())
+            }
+            Err(error) => Err(error.to_string()),
+        };
+
+        let _ = tx.send(SessionUsageSyncMsg::Finished { request_id, result });
+    }
 }
 
 fn app_data_worker_loop(rx: mpsc::Receiver<AppDataReq>, tx: mpsc::Sender<AppDataMsg>) {
@@ -1228,16 +1304,42 @@ fn handle_app_data_req(
             generation,
             app_state_epoch,
             app_type,
+            extras,
         } => {
-            let result = UiData::load(&app_type).map_err(|err| err.to_string());
-            (
-                AppDataLoadKind::Initial,
+            // Build the active app first and send it immediately so the UI paints
+            // as soon as possible; the config snapshot is reloaded once here.
+            let result = state_for_epoch(state_cache, app_state_epoch)
+                .and_then(|state| {
+                    state
+                        .reload_config_snapshot_from_db()
+                        .and_then(|()| UiData::load_fast_snapshot_from_state(state, &app_type))
+                })
+                .map_err(|err| err.to_string());
+            let _ = tx.send(AppDataMsg::Loaded {
+                kind: AppDataLoadKind::Initial,
                 request_id,
                 generation,
                 app_state_epoch,
                 app_type,
                 result,
-            )
+            });
+
+            // Warm the remaining visible apps from the SAME cached state (no extra
+            // DB open, SnapshotOnly), one Initial message each.
+            for (extra_app, extra_request_id) in extras {
+                let extra_result = state_for_epoch(state_cache, app_state_epoch)
+                    .and_then(|state| UiData::load_fast_snapshot_from_state(state, &extra_app))
+                    .map_err(|err| err.to_string());
+                let _ = tx.send(AppDataMsg::Loaded {
+                    kind: AppDataLoadKind::Initial,
+                    request_id: extra_request_id,
+                    generation,
+                    app_state_epoch,
+                    app_type: extra_app,
+                    result: extra_result,
+                });
+            }
+            return;
         }
         AppDataReq::Load {
             request_id,
@@ -1267,7 +1369,10 @@ fn handle_app_data_req(
             app_state_epoch,
             app_type,
         } => {
-            let result = UiData::load(&app_type).map_err(|err| err.to_string());
+            // Skip the usage/pricing aggregation here; it is deferred and loaded
+            // lazily by the usage-pricing worker when the Usage view is opened.
+            let result =
+                UiData::load_without_usage_pricing(&app_type).map_err(|err| err.to_string());
             (
                 AppDataLoadKind::Full,
                 request_id,
@@ -1449,9 +1554,16 @@ fn skills_worker_loop(rx: mpsc::Receiver<SkillsReq>, tx: mpsc::Sender<SkillsMsg>
             let err = e.to_string();
             while let Ok(req) = rx.recv() {
                 match req {
-                    SkillsReq::Discover { query } => {
+                    SkillsReq::Discover {
+                        request_id,
+                        query,
+                        source,
+                        ..
+                    } => {
                         let _ = tx.send(SkillsMsg::DiscoverFinished {
+                            request_id,
                             query,
+                            source,
                             result: Err(err.clone()),
                         });
                     }
@@ -1473,9 +1585,16 @@ fn skills_worker_loop(rx: mpsc::Receiver<SkillsReq>, tx: mpsc::Sender<SkillsMsg>
             let err = e.to_string();
             while let Ok(req) = rx.recv() {
                 match req {
-                    SkillsReq::Discover { query } => {
+                    SkillsReq::Discover {
+                        request_id,
+                        query,
+                        source,
+                        ..
+                    } => {
                         let _ = tx.send(SkillsMsg::DiscoverFinished {
+                            request_id,
                             query,
+                            source,
                             result: Err(err.clone()),
                         });
                     }
@@ -1493,24 +1612,83 @@ fn skills_worker_loop(rx: mpsc::Receiver<SkillsReq>, tx: mpsc::Sender<SkillsMsg>
 
     while let Ok(req) = rx.recv() {
         match req {
-            SkillsReq::Discover { query } => {
+            SkillsReq::Discover {
+                request_id,
+                query,
+                source,
+                force,
+            } => {
                 let query_trimmed = query.trim().to_lowercase();
-                let result = rt
-                    .block_on(async { service.list_skills().await })
-                    .map_err(|e| e.to_string())
-                    .map(|mut skills| {
-                        if !query_trimmed.is_empty() {
-                            skills.retain(|s| {
-                                s.name.to_lowercase().contains(&query_trimmed)
-                                    || s.directory.to_lowercase().contains(&query_trimmed)
-                                    || s.description.to_lowercase().contains(&query_trimmed)
-                                    || s.key.to_lowercase().contains(&query_trimmed)
-                            });
-                        }
-                        skills
-                    });
+                let installed_skill_keys = crate::services::SkillService::load_index()
+                    .map(|index| {
+                        index
+                            .skills
+                            .values()
+                            .map(|skill| {
+                                (
+                                    skill.directory.to_lowercase(),
+                                    skill
+                                        .repo_owner
+                                        .as_deref()
+                                        .unwrap_or_default()
+                                        .to_lowercase(),
+                                    skill
+                                        .repo_name
+                                        .as_deref()
+                                        .unwrap_or_default()
+                                        .to_lowercase(),
+                                )
+                            })
+                            .collect::<std::collections::HashSet<_>>()
+                    })
+                    .unwrap_or_default();
+                let result = match source {
+                    crate::cli::tui::app::SkillsDiscoverSource::Repos => rt
+                        .block_on(async { service.list_skills_cached(force).await })
+                        .map_err(|e| e.to_string()),
+                    crate::cli::tui::app::SkillsDiscoverSource::Marketplace => rt
+                        .block_on(async { service.search_skills_sh(&query, 50, 0).await })
+                        .map(|result| {
+                            result
+                                .skills
+                                .into_iter()
+                                .map(|skill| crate::services::skill::Skill {
+                                    installed: installed_skill_keys.contains(&(
+                                        skill.directory.to_lowercase(),
+                                        skill.repo_owner.to_lowercase(),
+                                        skill.repo_name.to_lowercase(),
+                                    )),
+                                    key: skill.key,
+                                    name: skill.name,
+                                    description: format!("{} installs", skill.installs),
+                                    directory: skill.directory,
+                                    readme_url: skill.readme_url,
+                                    repo_owner: Some(skill.repo_owner),
+                                    repo_name: Some(skill.repo_name),
+                                    repo_branch: Some(skill.repo_branch),
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .map_err(|e| e.to_string()),
+                }
+                .map(|mut skills| {
+                    if !query_trimmed.is_empty() {
+                        skills.retain(|s| {
+                            s.name.to_lowercase().contains(&query_trimmed)
+                                || s.directory.to_lowercase().contains(&query_trimmed)
+                                || s.description.to_lowercase().contains(&query_trimmed)
+                                || s.key.to_lowercase().contains(&query_trimmed)
+                        });
+                    }
+                    skills
+                });
 
-                let _ = tx.send(SkillsMsg::DiscoverFinished { query, result });
+                let _ = tx.send(SkillsMsg::DiscoverFinished {
+                    request_id,
+                    query,
+                    source,
+                    result,
+                });
             }
             SkillsReq::Install { spec, app } => {
                 let spec_clone = spec.clone();
@@ -1798,6 +1976,7 @@ mod tests {
             generation: 0,
             app_state_epoch: 0,
             app_type: AppType::Claude,
+            extras: Vec::new(),
         }]);
         let mut deferred = std::collections::VecDeque::new();
 
